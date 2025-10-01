@@ -9,16 +9,26 @@ with open(seq_file, "rb") as f:
 print("Keys:", data.keys())
 
 # Convert list -> numpy arrays
-poses = np.array(data["poses"])  # (n_frames, 72)
-trans = np.array(data["trans"])  # (n_frames, 3)
-joints3D = np.array(data["jointPositions"])  # (n_frames, 24, 3)
+poses = np.array(data["poses"]) 
+trans = np.array(data["trans"]) 
+joints3D = np.array(data["jointPositions"]) # (2, n_frames, 24*3)
 joints3D = joints3D.reshape(joints3D.shape[0], joints3D.shape[1], -1, 3)
-poses2d = np.array(data["poses2d"])  # (n_frames, 24, 3)  # [x,y,confidence]
+poses2d = np.array(data["poses2d"])
 
-print("poses:", poses.shape)
-print("trans:", trans.shape)
-print("joints3D:", joints3D.shape)
-print("poses2d:", poses2d.shape)
+num_frames = joints3D.shape[1]
+num_joints = joints3D.shape[2]
+
+conf = poses2d[..., 2, :]
+vis_mask = conf > 0.1
+visible_ratio = np.mean(vis_mask)
+
+print("Total frame:", num_frames)
+print("Number of 3D joints per person:", num_joints)
+print("Average visible joint ratio (2D):", visible_ratio)
+print("Poses shape:", poses.shape)
+print("Translation shape:", trans.shape)
+print("Joints 3D shape:", joints3D.shape)
+print("Poses 2D shape:", poses2d.shape)
 
 # Flatten tất cả thành (N, 24, 3)
 all_joints = joints3D.reshape(-1, 24, 3)
