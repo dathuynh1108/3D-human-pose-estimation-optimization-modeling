@@ -33,6 +33,8 @@ print("Poses 2D shape:", poses2d.shape)
 # Flatten tất cả thành (N, 24, 3)
 all_joints = joints3D.reshape(-1, 24, 3)
 
+print(all_joints.shape)  # (N_frames * N_persons, 24, 3)
+
 # Tên khớp theo 3DPW/SMPL (24 joints)
 joint_names = [
     "pelvis",

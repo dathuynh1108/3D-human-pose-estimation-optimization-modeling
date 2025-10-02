@@ -2,43 +2,37 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import least_squares
-
+import pickle
 # ------------------ Load COCO annotation ------------------
-# ann_file = "person_keypoints_train2017.json"
-# with open(ann_file, "r") as f:
-#     coco = json.load(f)
-
-# # COCO 17 joints (order chuẩn)
-# JOINTS = coco["categories"][0]["keypoints"]
 JOINTS = [
-    "nose",
-    "left_eye",
-    "right_eye",
-    "left_ear",
-    "right_ear",
+    "pelvis",
+    "left_hip",
+    "right_hip",
+    "spine1",
+    "left_knee",
+    "right_knee",
+    "spine2",
+    "left_ankle",
+    "right_ankle",
+    "spine3",
+    "left_foot",
+    "right_foot",
+    "neck",
+    "left_collar",
+    "right_collar",
+    "head",
     "left_shoulder",
     "right_shoulder",
     "left_elbow",
     "right_elbow",
     "left_wrist",
     "right_wrist",
-    "left_hip",
-    "right_hip",
-    "left_knee",
-    "right_knee",
-    "left_ankle",
-    "right_ankle",
+    "left_hand",
+    "right_hand",
 ]
+
 J = len(JOINTS)
 name_to_idx = {n: i for i, n in enumerate(JOINTS)}
-
-# # Skeleton từ annotation (1-based -> 0-based)
-# skeleton_pairs = [(i - 1, j - 1) for (i, j) in coco["categories"][0]["skeleton"]]
-
-# Lấy 1 person đầu tiên (có keypoints đủ rõ)
-# ann = next(a for a in coco["annotations"] if a["num_keypoints"] > 10)
-# print("Selected annotation", ann)
-# keypointts = ann["keypoints"]
 
 X_sample = np.array([
     [-0.17880496,  0.86162184, -1.33902938],
@@ -67,54 +61,121 @@ X_sample = np.array([
     [-0.40928843,  0.69576922, -1.33625061]
 ])
 
-# ------------------ Camera giả định ------------------
+def load_x_sample_from_3dpw(
+    person_idx=0,
+    frame_idx=0,
+):
+    seq_file = "3DPW/sequenceFiles/train/courtyard_basketball_00.pkl"
+
+    with open(seq_file, "rb") as f:
+        data = pickle.load(f, encoding="latin1")
+        joints3D = np.array(data["jointPositions"]) # (2, n_frames, 24*3)
+        joints3D = joints3D.reshape(joints3D.shape[0], joints3D.shape[1], -1, 3)
+        return joints3D[person_idx, frame_idx]
+
+X_sample = load_x_sample_from_3dpw(
+    person_idx=1,
+    frame_idx=100,
+)
+print("Sample 3D points:\n", X_sample)
+# ------------------ Init problem ------------------
+# Camera intrinsics
 f = 1000.0
 K = np.array([[f, 0, 320.0], [0, f, 240.0], [0, 0, 1.0]])
 R = np.eye(3)
 t = np.zeros(3)
+
+# Bounds
+M = f
+Zmin, Zmax = -f, f
+lb = np.tile([-M, -M, Zmin], J)
+ub = np.tile([ M,  M, Zmax], J)
+
 # ------------------ Bone priors ------------------
-# Bone priors: danh sách (i,j,l_ij)
-bone_priors = [
-    (0,1,0.104), (0,2,0.106), (0,3,0.114),  # pelvis-hip-spine
-    (1,4,0.376), (2,5,0.379),
-    (4,7,0.404), (5,8,0.400),
-    (7,10,0.134), (8,11,0.137),
-    (3,6,0.136), (6,9,0.054), (9,12,0.207),
-    (12,15,0.092), (12,13,0.121), (12,14,0.116),
-    (13,16,0.109), (14,17,0.106),
-    (16,18,0.253), (17,19,0.252),
-    (18,20,0.251), (19,21,0.256),
-    (20,22,0.083), (21,23,0.084)
+bone_table = [
+    ("pelvis","left_hip",0.104),
+    ("pelvis","right_hip",0.106),
+    ("pelvis","spine1",0.114),
+    ("left_hip","left_knee",0.376),
+    ("right_hip","right_knee",0.379),
+    ("left_knee","left_ankle",0.404),
+    ("right_knee","right_ankle",0.400),
+    ("left_ankle","left_foot",0.134),
+    ("right_ankle","right_foot",0.137),
+    ("spine1","spine2",0.136),
+    ("spine2","spine3",0.054),
+    ("spine3","neck",0.207),
+    ("neck","head",0.092),
+    ("neck","left_collar",0.121),
+    ("neck","right_collar",0.116),
+    ("left_collar","left_shoulder",0.109),
+    ("right_collar","right_shoulder",0.106),
+    ("left_shoulder","left_elbow",0.253),
+    ("right_shoulder","right_elbow",0.252),
+    ("left_elbow","left_wrist",0.251),
+    ("right_elbow","right_wrist",0.256),
+    ("left_wrist","left_hand",0.083),
+    ("right_wrist","right_hand",0.080),
+]
+bones = [(name_to_idx[a], name_to_idx[b], L) for (a,b,L) in bone_table]
+print("Bones (idx):", bones)
+# ------------------ Mean coords (mu) & Sigma^{-1} ------------------
+mu = np.array([
+    [0.484, 0.734, -0.884],  # pelvis
+    [0.514, 0.656, -0.896],  # left_hip
+    [0.456, 0.646, -0.884],  # right_hip
+    [0.483, 0.841, -0.896],  # spine1
+    [0.547, 0.322, -0.898],  # left_knee
+    [0.445, 0.307, -0.834],  # right_knee
+    [0.483, 0.940, -0.876],  # spine2
+    [0.549, -0.053, -0.958], # left_ankle
+    [0.440, -0.058, -0.862], # right_ankle
+    [0.485, 0.974, -0.865],  # spine3
+    [0.573, -0.115, -0.912], # left_foot
+    [0.434, -0.125, -0.804], # right_foot
+    [0.475, 1.148, -0.847],  # neck
+    [0.514, 1.076, -0.861],  # left_collar
+    [0.443, 1.068, -0.855],  # right_collar
+    [0.484, 1.191, -0.818],  # head
+    [0.566, 1.084, -0.856],  # left_shoulder
+    [0.396, 1.073, -0.844],  # right_shoulder
+    [0.583, 0.851, -0.883],  # left_elbow
+    [0.381, 0.844, -0.850],  # right_elbow
+    [0.590, 0.645, -0.849],  # left_wrist
+    [0.389, 0.639, -0.815],  # right_wrist
+    [0.597, 0.583, -0.837],  # left_hand
+    [0.388, 0.578, -0.802],  # right_hand
+], dtype=float)
+
+Sigma_inv = [np.eye(3, dtype=float) for _ in range(J)]
+
+# Triplets: (i,j,k) với góc tại j
+angle_triplets = [
+    (1, 4, 7),  (2, 5, 8),     # knees
+    (16, 18, 20), (17, 19, 21),# elbows
+    (4, 7, 10), (5, 8, 11),    # ankles
+    (0, 1, 4),  (0, 2, 5),     # hips
+    (13, 16, 18), (14, 17, 19),# shoulders
+    (9, 12, 15),               # neck
+    (12, 13, 16), (12, 14, 17) # clavicles
 ]
 
+angle_ranges = [
+    (np.deg2rad(5),  np.deg2rad(175)),  # left knee
+    (np.deg2rad(5),  np.deg2rad(175)),  # right knee
+    (np.deg2rad(5),  np.deg2rad(175)),  # left elbow
+    (np.deg2rad(5),  np.deg2rad(175)),  # right elbow
+    (np.deg2rad(70), np.deg2rad(120)),  # left ankle
+    (np.deg2rad(70), np.deg2rad(120)),  # right ankle
+    (np.deg2rad(30), np.deg2rad(160)),  # left hip
+    (np.deg2rad(30), np.deg2rad(160)),  # right hip
+    (np.deg2rad(20), np.deg2rad(170)),  # left shoulder
+    (np.deg2rad(20), np.deg2rad(170)),  # right shoulder
+    (np.deg2rad(30), np.deg2rad(150)),  # neck
+    (np.deg2rad(30), np.deg2rad(150)),  # left collar
+    (np.deg2rad(30), np.deg2rad(150)),  # right collar
+]
 
-mu = np.array([
-    [0.48415953, 0.73363288, -0.88355522],  # pelvis
-    [0.51364254, 0.65561637, -0.89585048],  # left_hip
-    [0.45641076, 0.64602094, -0.88448214],  # right_hip
-    [0.48267321, 0.84086531, -0.89596092],  # spine1
-    [0.54712188, 0.32167322, -0.8981805 ],  # left_knee
-    [0.44468169, 0.30665255, -0.83387553],  # right_knee
-    [0.48264703, 0.93995383, -0.87576046],  # spine2
-    [0.54860239, -0.05319843, -0.95784013], # left_ankle
-    [0.44027805, -0.05801534, -0.86240923], # right_ankle
-    [0.48462257, 0.97434326, -0.86455489],  # spine3
-    [0.57285094, -0.11490147, -0.91150673], # left_foot
-    [0.43379357, -0.12548486, -0.80401562], # right_foot
-    [0.47462718, 1.14775028, -0.84739056],  # neck
-    [0.51383965, 1.07599859, -0.86123404],  # left_collar
-    [0.44294782, 1.06752914, -0.85471309],  # right_collar
-    [0.48399632, 1.19105959, -0.81793115],  # head
-    [0.56599564, 1.08363046, -0.85592647],  # left_shoulder
-    [0.39570553, 1.07343208, -0.84418985],  # right_shoulder
-    [0.58273607, 0.85149706, -0.88340816],  # left_elbow
-    [0.38100859, 0.84413   , -0.84973564],  # right_elbow
-    [0.58994725, 0.64521079, -0.8487193 ],  # left_wrist
-    [0.388771  , 0.63938364, -0.81503741],  # right_wrist
-    [0.59658561, 0.58282327, -0.83714405],  # left_hand
-    [0.38751554, 0.57822964, -0.80161642],  # right_hand
-])
-Sigma_inv = [np.eye(3) for _ in range(24)]
 
 # ------------------ Helper ------------------
 def project_pinhole(K, R, t, X):
@@ -123,7 +184,7 @@ def project_pinhole(K, R, t, X):
     return np.stack([Y[:, 0] / Y[:, 2], Y[:, 1] / Y[:, 2]], axis=1)
 
 
-def init_X_from_pinhole(x2d, K, z0=2000.0):
+def init_X_from_pinhole(x2d, K, z0=1):
     N = x2d.shape[0]
     homog = np.hstack([x2d, np.ones((N, 1))])
     rays = (np.linalg.inv(K) @ homog.T).T
@@ -135,33 +196,7 @@ def init_X_from_pinhole(x2d, K, z0=2000.0):
 x2d_clean = project_pinhole(K, R, t, X_sample)
 rng = np.random.default_rng(0)
 x2d = x2d_clean + rng.normal(0, 0.8, size=x2d_clean.shape) 
-
-mean_bone_lengths = {
-    ("left_ankle", "left_knee"): 50.2,
-    ("left_knee", "left_hip"): 51.6,
-    ("right_ankle", "right_knee"): 50.1,
-    ("right_knee", "right_hip"): 51.6,
-    ("left_hip", "right_hip"): 30.2,
-    ("left_shoulder", "left_hip"): 77.5,
-    ("right_shoulder", "right_hip"): 77.2,
-    ("left_shoulder", "right_shoulder"): 50.3,
-    ("left_shoulder", "left_elbow"): 47.0,
-    ("right_shoulder", "right_elbow"): 47.2,
-    ("left_elbow", "left_wrist"): 37.1,
-    ("right_elbow", "right_wrist"): 37.7,
-    ("left_eye", "right_eye"): 15.1,
-    ("nose", "left_eye"): 11.0,
-    ("nose", "right_eye"): 11.0,
-    ("left_eye", "left_ear"): 18.0,
-    ("right_eye", "right_ear"): 17.6,
-    ("left_ear", "left_shoulder"): 39.7,
-    ("right_ear", "right_shoulder"): 39.3,
-}
-bones = []
-for a, b, L in [(a, b, L) for (a, b), L in mean_bone_lengths.items()]:
-    if a in name_to_idx and b in name_to_idx:
-        bones.append((name_to_idx[a], name_to_idx[b], L))
-
+print("2D points (with noise):\n", x2d)
 
 # ------------------ Loss ------------------
 def residuals_data(X, x2d, K, R, t):
@@ -178,28 +213,81 @@ def residuals_prior(X, mu, Sigma_inv, lam_prior=1.0):
         res.extend(np.sqrt(lam_prior)*(Sigma_inv[i] @ d))
     return res
 
-def residuals_full(x_flat, x2d, K,R,t, bones, mu, Sigma_inv,
-                   lam_bone=10.0, lam_prior=1.0):
+def residuals_angle(X, angle_triplets, angle_ranges, lam_angle=5.0):
+    """
+    Joint angle penalties using cosine constraints.
+    Each angle (i,j,k) corresponds to the angle at joint j formed by vectors (i-j) and (k-j).
+    angle_ranges = [(amin, amax), ...] in radians.
+    """
+    res = []
+    s = np.sqrt(lam_angle)
+    for (i, j, k), (amin, amax) in zip(angle_triplets, angle_ranges):
+        u = X[i] - X[j]
+        v = X[k] - X[j]
+        cos_th = np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9)
+
+        # Expected cosine interval [cos(amax), cos(amin)]  (since cos is decreasing on [0,pi])
+        cmin, cmax = np.cos(amax), np.cos(amin)
+
+        # Residual = violation amount (0 if inside the range)
+        if cos_th < cmin:
+            penalty = cos_th - cmin
+        elif cos_th > cmax:
+            penalty = cos_th - cmax
+        else:
+            penalty = 0.0
+
+        res.append(s * penalty)
+    return res
+
+
+def residuals_full(
+    x_flat, 
+    x2d, 
+    K,R,t, 
+    bones, 
+    mu, 
+    Sigma_inv,
+    angle_triplets,
+    angle_ranges,
+    lam_bone=10.0, 
+    lam_prior=1.0,
+    lam_angle=5.0,
+):
     X = x_flat.reshape(-1,3)
     res_all = []
     res_all.append(residuals_data(X,x2d,K,R,t))
     if lam_bone>0: res_all.append(residuals_bone(X,bones,lam_bone))
     if lam_prior>0: res_all.append(residuals_prior(X,mu,Sigma_inv,lam_prior))
+    if lam_angle>0: res_all.append(residuals_angle(X,angle_triplets,angle_ranges,lam_angle))
     return np.concatenate(res_all)
 
-# ------------------ Init 3D points ------------------
-X0 = init_X_from_pinhole(x2d, K, z0=2000.0)
 
+
+# ------------------ Init 3D points ------------------
+X0 = init_X_from_pinhole(x2d, K, z0=1)
 # ------------------ Optimize ------------------    
 res = least_squares(
     residuals_full,
     X0.ravel(),
-    args=(x2d_clean,K,np.eye(3),np.zeros(3),
-          bone_priors, mu, Sigma_inv, 10.0, 1.0),
+    args=(
+        x2d_clean,
+        K,
+        np.eye(3),
+        np.zeros(3),
+        bones, 
+        mu, 
+        Sigma_inv, 
+        angle_triplets,
+        angle_ranges,
+        10.0, 1.0, 5.0
+    ),
     loss="huber",
     f_scale=3.0,
-    max_nfev=10000
+    max_nfev=30000,
+    bounds=(lb, ub),
 )
+
 X_opt = res.x.reshape(-1, 3)
 proj_opt = project_pinhole(K, R, t, X_opt)
 
@@ -246,9 +334,11 @@ draw_edges3d(ax1, X_opt, EDGES_3DPW, c='r')
 
 # --- 2D reprojection ---
 ax2.scatter(x2d_clean[:,0], x2d_clean[:,1], c='g', s=20, label='GT 2D')
-ax2.scatter(x2d[:,0], x2d[:,1], c='r', s=24, marker='x', label='Opt reproj')
+ax2.scatter(x2d[:,0], x2d[:,1], c='r', s=24, marker='x', label='GT 2D + noise')
+ax2.scatter(proj_opt[:,0], proj_opt[:,1], c='b', s=20, label='Optimized reproj.')
 draw_edges2d(ax2, x2d_clean,  EDGES_3DPW, c='g', lw=1.0, alpha=0.4)   # optional
-draw_edges2d(ax2, x2d, EDGES_3DPW, c='r', lw=1.0, alpha=0.4)   # optional
+draw_edges2d(ax2, x2d, EDGES_3DPW, c='b', lw=1.0, alpha=0.4)   # optional
+draw_edges2d(ax2, proj_opt, EDGES_3DPW, c='r', lw=1.0, alpha=0.6)
 ax2.invert_yaxis()
 ax2.legend()
 
