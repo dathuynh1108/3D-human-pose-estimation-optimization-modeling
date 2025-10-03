@@ -106,3 +106,35 @@ for i, j in skeleton:
 print("\nMean bone lengths (3D):")
 for a, b, L in bone_lengths:
     print(f"{a:15s} - {b:15s}: {L:.3f}")
+
+
+eps_reg = 1e-4  # regularization để tránh singular
+
+# ---- 3. Tính mu và Sigma ----
+Sigma = np.zeros((24, 3, 3))
+Sigma_inv = []
+
+for j in range(num_joints):
+    D = all_joints[:, j, :] - mean_coords[j]        # (N, 3)
+    C = (D.T @ D) / max(1, D.shape[0] - 1) # (3, 3) covariance
+    C += eps_reg * np.eye(3)               # regularization
+    Sigma[j] = C
+
+    # nghịch đảo ổn định (Cholesky safer hơn inv)
+    try:
+        L = np.linalg.cholesky(C)
+        Linv = np.linalg.inv(L)
+        C_inv = Linv.T @ Linv
+    except np.linalg.LinAlgError:
+        C_inv = np.linalg.pinv(C)  # fallback nếu không SPD
+    Sigma_inv.append(C_inv)
+
+Sigma_inv = np.array(Sigma_inv)  # (24, 3, 3)
+
+print("Sigma shape:", Sigma.shape)
+print("Sigma_inv shape:", Sigma_inv.shape)
+
+print("\n===== Joint Statistics =====")
+print(Sigma)
+print("\n===== Inverse Joint Statistics =====")
+print(Sigma_inv)
