@@ -1,7 +1,137 @@
-import json
+# ==== 1) PyTorch optimizer for your objective (keep angle penalty) ====
+import torch
+torch.set_default_dtype(torch.float64)
+# Set GPU if available
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def to_torch(x):
+    return torch.from_numpy(x.copy()).to(device)
+
+def torch_project_pinhole(K, R, t, X):
+    # X: (J,3), R: (3,3), t: (3,), K: (3,3)
+    Y = X @ R.T + t      # (J,3)
+    Y = Y @ K.T          # (J,3)
+    u = Y[:, 0] / Y[:, 2]
+    v = Y[:, 1] / Y[:, 2]
+    return torch.stack([u, v], dim=1)
+
+def torch_residuals_data(X, x2d, K, R, t):
+    proj = torch_project_pinhole(K, R, t, X)
+    return (proj - x2d).reshape(-1)   # (2J,)
+
+def torch_residuals_bone(X, bones, lam_bone=10.0):
+    if lam_bone <= 0: return X.new_zeros((0,))
+    s = torch.sqrt(torch.tensor(lam_bone, dtype=X.dtype))
+    res = []
+    for (i, j, L) in bones:
+        d = torch.linalg.norm(X[i] - X[j])
+        res.append(s * (d - L))
+    return torch.stack(res) if res else X.new_zeros((0,))
+
+def torch_residuals_prior(X, mu, Sigma_inv, lam_prior=1.0):
+    if lam_prior <= 0: return X.new_zeros((0,))
+    s = torch.sqrt(torch.tensor(lam_prior, dtype=X.dtype))
+    res = []
+    for i in range(X.shape[0]):
+        d = X[i] - mu[i]
+        res.append(s * (Sigma_inv[i] @ d))
+    return torch.cat(res) if res else X.new_zeros((0,))
+
+def torch_residuals_angle(X, triplets, ranges, lam_angle=5.0, eps=1e-9):
+    if lam_angle <= 0: return X.new_zeros((0,))
+    s = torch.sqrt(torch.tensor(lam_angle, dtype=X.dtype))
+    res = []
+    for (i, j, k), (amin, amax) in zip(triplets, ranges):
+        u = X[i] - X[j]
+        v = X[k] - X[j]
+        cos_th = (u @ v) / (torch.linalg.norm(u)*torch.linalg.norm(v) + eps)
+        cmin, cmax = torch.cos(torch.tensor(amax)), torch.cos(torch.tensor(amin))
+        # soft hinge (mượt hơn ReLU)
+        kappa = 20.0
+        viol_low  = cmin - cos_th
+        viol_high = cos_th - cmax
+        x = torch.where(viol_low  > 0, viol_low,
+            torch.where(viol_high > 0, viol_high, torch.tensor(0.0, dtype=X.dtype)))
+        pen = torch.log1p(torch.exp(kappa*x)) / kappa
+        res.append(s * pen)
+    return torch.stack(res) if res else X.new_zeros((0,))
+
+def torch_objective(X, x2d, K, R, t, bones, mu, Sigma_inv,
+                    angle_triplets, angle_ranges,
+                    lam_bone, lam_prior, lam_angle,
+                    f_scale=3.0):
+    """
+    Tổng Huber trên TẤT CẢ residuals (data + bone + prior + angle) để robust.
+    """
+    r = []
+    r.append(torch_residuals_data (X, x2d, K, R, t))
+    r.append(torch_residuals_bone (X, bones, lam_bone))
+    r.append(torch_residuals_prior(X, mu, Sigma_inv, lam_prior))
+    r.append(torch_residuals_angle(X, angle_triplets, angle_ranges, lam_angle))
+    r = torch.cat(r)
+
+    # Huber loss theo chuẩn SciPy (f_scale)
+    a = torch.abs(r)
+    fs = torch.tensor(f_scale, dtype=X.dtype)
+    huber = torch.where(a <= fs, 0.5*(r**2), fs*(a - 0.5*fs))
+    return huber.sum()
+
+def optimize_pose_with_torch(X0_np, x2d_np, K_np, bones, mu_np, Sigma_inv_np,
+                             angle_triplets, angle_ranges,
+                             lam_bone=2.0, lam_prior=1.0, lam_angle=1.0,
+                             Zmin=0.0, steps_adam=30000, steps_lbfgs=2000):
+    J = X0_np.shape[0]
+
+    # Chuẩn bị dữ liệu torch
+    x2d = to_torch(x2d_np)
+    K   = to_torch(K_np)
+    R   = torch.eye(3, dtype=torch.float64, device=device)
+    t   = torch.zeros(3, dtype=torch.float64, device=device)
+    mu  = to_torch(mu_np)
+    Sigma_inv = to_torch(Sigma_inv_np)
+
+    # Tham số hoá X = [x_raw, y_raw, Zmin + softplus(z_raw)]
+    X0 = to_torch(X0_np)
+    x_raw = torch.nn.Parameter(X0[:,0].clone())
+    y_raw = torch.nn.Parameter(X0[:,1].clone())
+    # lấy z_raw sao cho softplus(z_raw) ~ X0[:,2]-Zmin
+    z_raw = torch.nn.Parameter(torch.log(torch.exp(torch.clamp(X0[:,2]-Zmin, min=1e-3)) - 1.0))
+
+    opt = torch.optim.Adam([x_raw, y_raw, z_raw], lr=1e-2)
+    for _ in range(steps_adam):
+        opt.zero_grad()
+        Z = Zmin + torch.nn.functional.softplus(z_raw)
+        X = torch.stack([x_raw, y_raw, Z], dim=1)
+        loss = torch_objective(X, x2d, K, R, t, bones, mu, Sigma_inv,
+                               angle_triplets, angle_ranges,
+                               lam_bone, lam_prior, lam_angle, f_scale=3.0)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([x_raw, y_raw, z_raw], max_norm=10.0)
+        opt.step()
+
+    def closure():
+        opt_lbfgs.zero_grad()
+        Z = Zmin + torch.nn.functional.softplus(z_raw)
+        X = torch.stack([x_raw, y_raw, Z], dim=1)
+        loss = torch_objective(X, x2d, K, R, t, bones, mu, Sigma_inv,
+                               angle_triplets, angle_ranges,
+                               lam_bone, lam_prior, lam_angle, f_scale=3.0)
+        loss.backward()
+        return loss
+
+    opt_lbfgs = torch.optim.LBFGS([x_raw, y_raw, z_raw], lr=1.0, max_iter=steps_lbfgs,
+                                  line_search_fn="strong_wolfe")
+    opt_lbfgs.step(closure)
+
+    with torch.no_grad():
+        X_final = torch.stack([x_raw,
+                               y_raw,
+                               Zmin + torch.nn.functional.softplus(z_raw)], dim=1)
+    return X_final.cpu().numpy()
+
+
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.optimize import least_squares
 import pickle
 
 
@@ -349,112 +479,16 @@ rng = np.random.default_rng(0)
 x2d = x2d_clean + rng.normal(0, 0.8, size=x2d_clean.shape)
 
 print("2D points (with noise):\n", x2d)
-
-
-# ------------------ Loss ------------------
-def residuals_data(X, x2d, K, R, t):
-    proj = project_pinhole(K, R, t, X)
-    return (proj - x2d).reshape(-1)
-
-
-def residuals_bone(X, bones, lam_bone=10.0):
-    return [
-        np.sqrt(lam_bone) * (np.linalg.norm(X[i] - X[j]) - l) for (i, j, l) in bones
-    ]
-
-
-def residuals_prior(X, mu, Sigma_inv, lam_prior=1.0):
-    res = []
-    for i in range(X.shape[0]):
-        d = X[i] - mu[i]
-        res.extend(np.sqrt(lam_prior) * (Sigma_inv[i] @ d))
-    return res
-
-
-def residuals_angle(X, angle_triplets, angle_ranges, lam_angle=5.0):
-    """
-    Joint angle penalties using cosine constraints.
-    Each angle (i,j,k) corresponds to the angle at joint j formed by vectors (i-j) and (k-j).
-    angle_ranges = [(amin, amax), ...] in radians.
-    """
-    res = []
-    s = np.sqrt(lam_angle)
-    for (i, j, k), (amin, amax) in zip(angle_triplets, angle_ranges):
-        u = X[i] - X[j]
-        v = X[k] - X[j]
-        cos_th = np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-9)
-
-        # Expected cosine interval [cos(amax), cos(amin)]  (since cos is decreasing on [0,pi])
-        cmin, cmax = np.cos(amax), np.cos(amin)
-
-        # Residual = violation amount (0 if inside the range)
-        if cos_th < cmin:
-            penalty = cos_th - cmin
-        elif cos_th > cmax:
-            penalty = cos_th - cmax
-        else:
-            penalty = 0.0
-
-        res.append(s * penalty)
-    return res
-
-
-def residuals_full(
-    x_flat,
-    x2d,
-    K,
-    R,
-    t,
-    bones,
-    mu,
-    Sigma_inv,
-    angle_triplets,
-    angle_ranges,
-    lam_bone=2.0,
-    lam_prior=1.0,
-    lam_angle=1.0,
-):
-    X = x_flat.reshape(-1, 3)
-    res_all = []
-    res_all.append(residuals_data(X, x2d, K, R, t))
-    if lam_bone > 0:
-        res_all.append(residuals_bone(X, bones, lam_bone))
-    if lam_prior > 0:
-        res_all.append(residuals_prior(X, mu, Sigma_inv, lam_prior))
-    if lam_angle > 0:
-        res_all.append(residuals_angle(X, angle_triplets, angle_ranges, lam_angle))
-    return np.concatenate(res_all)
-
-
 # ------------------ Init 3D points ------------------
 X0 = backproject_fixed_depth(x2d, K, z0=0.5)
 print("Initial 3D points:\n", X0)
-schedule = [
-    (0.5,  0.2, 5.0),
-    (2.0,  1.0, 3.0),
-    (10.0, 5.0, 1.5),  
-    (20.0, 10.0, 1.0),
-]
-# ------------------ Optimize ------------------
-X_init = X0.copy()
-for lam_bone, lam_angle, fscale in schedule:
-    res = least_squares(
-        residuals_full,
-        X_init.ravel(),
-        args=(x2d, K, np.eye(3), np.zeros(3), bones, mu, Sigma_inv,
-              angle_triplets, angle_ranges, lam_bone, 1.0, lam_angle),
-        loss="huber",
-        f_scale=3.0,
-        max_nfev=30000,
-        ftol=1e-9,
-        xtol=1e-9,
-        gtol=1e-9,
-        bounds=(lb, ub),
-        verbose=2,
-    )
-    X_init = res.x.reshape(-1, 3)  # nghiệm bước này làm init cho bước sau
-
-X_opt = res.x.reshape(-1, 3)
+X0_init = X0  # dùng init của bạn, càng tốt nếu là init_from_bones
+X_opt = optimize_pose_with_torch(
+    X0_init, x2d, K, bones, mu, Sigma_inv,
+    angle_triplets, angle_ranges,
+    lam_bone=10.0, lam_prior=1.0, lam_angle=1.0,
+    Zmin=0.15,
+)
 proj_opt = project_pinhole(K, R, t, X_opt)
 
 
