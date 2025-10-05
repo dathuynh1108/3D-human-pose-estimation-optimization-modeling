@@ -125,7 +125,7 @@ t = np.zeros(3)
 
 # Bounds
 M = 10.0
-Zmin, Zmax = -10.0, 10.0
+Zmin, Zmax = 0.0, 15.0
 lb = np.tile([-M, -M, Zmin], J)
 ub = np.tile([M, M, Zmax], J)
 
@@ -327,7 +327,7 @@ angle_ranges = [
 
 
 # ------------------ Helper ------------------
-def backproject_fixed_depth(x2d_px, K, z0=1):
+def backproject_fixed_depth(x2d_px, K, z0=0.5):
     """
     x2d_px: (N,2) toạ độ pixel
     K: (3,3) intrinsics [fx, 0, cx; 0, fy, cy; 0, 0, 1]
@@ -410,9 +410,9 @@ def residuals_full(
     Sigma_inv,
     angle_triplets,
     angle_ranges,
-    lam_bone=10.0,
+    lam_bone=2.0,
     lam_prior=1.0,
-    lam_angle=5.0,
+    lam_angle=1.0,
 ):
     X = x_flat.reshape(-1, 3)
     res_all = []
@@ -427,7 +427,7 @@ def residuals_full(
 
 
 # ------------------ Init 3D points ------------------
-X0 = backproject_fixed_depth(x2d, K, z0=1)
+X0 = backproject_fixed_depth(x2d, K, z0=0.5)
 print("Initial 3D points:\n", X0)
 # ------------------ Optimize ------------------
 res = least_squares(
@@ -445,12 +445,16 @@ res = least_squares(
         angle_ranges,
         10.0,
         1.0,
-        5.0,
+        1.0,
     ),
     loss="huber",
     f_scale=3.0,
     max_nfev=30000,
-    # bounds=(lb, ub),
+    ftol=1e-9,
+    xtol=1e-9,
+    gtol=1e-9,
+    bounds=(lb, ub),
+    verbose=2,
 )
 
 X_opt = res.x.reshape(-1, 3)
