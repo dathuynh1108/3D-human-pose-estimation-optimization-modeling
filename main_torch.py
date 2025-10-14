@@ -1,133 +1,243 @@
 # ==== 1) PyTorch optimizer for your objective (keep angle penalty) ====
 import torch
+from common import (
+    load_x_sample_from_3dpw,
+    to_cv_from_3dpw,
+    to_3dpw_from_cv,
+    JOINTS,
+    J,
+    name_to_idx,
+    torch_project_pinhole,
+)
+
 torch.set_default_dtype(torch.float64)
+
 # Set GPU if available
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else (
+        "mps"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+        else "cpu"
+    )
+)
+
 
 def to_torch(x):
     return torch.from_numpy(x.copy()).to(device)
 
+
+def huber1d(r, delta):
+    a = torch.abs(r)
+    d = torch.as_tensor(delta, dtype=r.dtype, device=r.device)
+    return torch.where(a <= d, 0.5 * r * r, d * (a - 0.5 * d))
+
+
 def torch_project_pinhole(K, R, t, X):
     # X: (J,3), R: (3,3), t: (3,), K: (3,3)
-    Y = X @ R.T + t      # (J,3)
-    Y = Y @ K.T          # (J,3)
+    Y = X @ R.T + t  # (J,3)
+    Y = Y @ K.T  # (J,3)
     u = Y[:, 0] / Y[:, 2]
     v = Y[:, 1] / Y[:, 2]
     return torch.stack([u, v], dim=1)
 
-def torch_residuals_data(X, x2d, K, R, t):
-    proj = torch_project_pinhole(K, R, t, X)
-    return (proj - x2d).reshape(-1)   # (2J,)
 
-def torch_residuals_bone(X, bones, lam_bone=10.0):
-    if lam_bone <= 0: return X.new_zeros((0,))
-    s = torch.sqrt(torch.tensor(lam_bone, dtype=X.dtype))
-    res = []
-    for (i, j, L) in bones:
-        d = torch.linalg.norm(X[i] - X[j])
-        res.append(s * (d - L))
-    return torch.stack(res) if res else X.new_zeros((0,))
+# ===================== Terms =====================
 
-def torch_residuals_prior(X, mu, Sigma_inv, lam_prior=1.0):
-    if lam_prior <= 0: return X.new_zeros((0,))
-    s = torch.sqrt(torch.tensor(lam_prior, dtype=X.dtype))
-    res = []
-    for i in range(X.shape[0]):
-        d = X[i] - mu[i]
-        res.append(s * (Sigma_inv[i] @ d))
-    return torch.cat(res) if res else X.new_zeros((0,))
 
-def torch_residuals_angle(X, triplets, ranges, lam_angle=5.0, eps=1e-9):
-    if lam_angle <= 0: return X.new_zeros((0,))
-    s = torch.sqrt(torch.tensor(lam_angle, dtype=X.dtype))
-    res = []
+def term_data_huber(X, x2d, K, R, t, delta):
+    """
+    sum_i φ_δ( ||π(K,R,t,X_i) - x_i^{2D}||_2 )
+    """
+    proj = torch_project_pinhole(K, R, t, X)  # (J,2)
+    err2 = torch.linalg.norm(proj - x2d, dim=1)  # (J,)
+    return huber1d(err2, delta).sum()
+
+
+def term_bone_logratio_sq(
+    X, bone_idx, l_ij, sigma_ij, lam_bone, eps=1e-8, sigma_min=1e-6
+):
+    """
+    λ_bone * Σ [(log d - log l_ij)/σ_ij]^2
+    """
+    if lam_bone <= 0:
+        return X.new_tensor(0.0)
+    i = bone_idx[:, 0]
+    j = bone_idx[:, 1]
+    d = torch.linalg.norm(X[i] - X[j], dim=1)  # (E,)
+    logd = torch.log(torch.clamp(d, min=eps))
+    r = (logd - torch.log(torch.clamp(l_ij, min=eps))) / torch.clamp(
+        sigma_ij, min=sigma_min
+    )
+    return lam_bone * (r * r).sum()
+
+
+def term_alpha_log(X, bone_idx, alpha, eps=1e-8):
+    """
+    + α * Σ log ||X_i - X_j||_2
+    (đúng theo bản mô hình bạn ghi)
+    """
+    if alpha == 0:
+        return X.new_tensor(0.0)
+    i = bone_idx[:, 0]
+    j = bone_idx[:, 1]
+    d = torch.linalg.norm(X[i] - X[j], dim=1)
+    return alpha * torch.log(torch.clamp(d, min=eps)).sum()
+
+
+def term_prior_mahalanobis(X, mu, Sigma_inv, lam_prior):
+    """
+    λ_prior * Σ (X_i - μ_i)^T Σ_i^{-1} (X_i - μ_i)
+    """
+    if lam_prior <= 0:
+        return X.new_tensor(0.0)
+    D = X - mu  # (J,3)
+    q = torch.einsum("bi,bij,bj->b", D, Sigma_inv, D)  # (J,)
+    return lam_prior * q.sum()
+
+
+def term_angle_mbeta_sq(X, triplets, ranges, lam_angle, beta=20.0, eps=1e-9):
+    """
+    λ_angle * Σ [ mβ( θ-θmax, θmin-θ ) ]^2
+    với mβ(u,v) = (1/β) log(1 + exp(βu) + exp(βv))
+    """
+    if lam_angle <= 0:
+        return X.new_tensor(0.0)
+
+    loss = X.new_tensor(0.0)
     for (i, j, k), (amin, amax) in zip(triplets, ranges):
         u = X[i] - X[j]
         v = X[k] - X[j]
-        cos_th = (u @ v) / (torch.linalg.norm(u)*torch.linalg.norm(v) + eps)
-        cmin, cmax = torch.cos(torch.tensor(amax)), torch.cos(torch.tensor(amin))
-        # soft hinge (mượt hơn ReLU)
-        kappa = 20.0
-        viol_low  = cmin - cos_th
-        viol_high = cos_th - cmax
-        x = torch.where(viol_low  > 0, viol_low,
-            torch.where(viol_high > 0, viol_high, torch.tensor(0.0, dtype=X.dtype)))
-        pen = torch.log1p(torch.exp(kappa*x)) / kappa
-        res.append(s * pen)
-    return torch.stack(res) if res else X.new_zeros((0,))
+        nu = torch.linalg.norm(u)
+        nv = torch.linalg.norm(v)
+        # cos θ
+        cos_th = (u @ v) / (nu * nv + eps)
+        cos_th = torch.clamp(cos_th, -1.0 + 1e-7, 1.0 - 1e-7)
+        theta = torch.arccos(cos_th)
 
-def torch_objective(X, x2d, K, R, t, bones, mu, Sigma_inv,
-                    angle_triplets, angle_ranges,
-                    lam_bone, lam_prior, lam_angle,
-                    f_scale=3.0):
+        u1 = theta - torch.as_tensor(amax, dtype=X.dtype, device=X.device)
+        v1 = torch.as_tensor(amin, dtype=X.dtype, device=X.device) - theta
+
+        b = torch.as_tensor(beta, dtype=X.dtype, device=X.device)
+        m = torch.log1p(torch.exp(b * u1) + torch.exp(b * v1)) / b  # smooth max{0,u,v}
+        loss = loss + (m * m)
+
+    return lam_angle * loss
+
+
+# ===================== Full Objective =====================
+
+
+def objective_F(
+    X,
+    x2d,
+    K,
+    R,
+    t,
+    bone_idx,
+    l_ij,
+    sigma_ij,
+    mu,
+    Sigma_inv,
+    angle_triplets,
+    angle_ranges,
+    delta,  # Huber δ
+    lam_bone,
+    alpha,
+    lam_prior,
+    lam_angle,
+    beta_angle=20.0,
+):
+    return (
+        term_data_huber(X, x2d, K, R, t, delta)
+        + term_bone_logratio_sq(X, bone_idx, l_ij, sigma_ij, lam_bone)
+        + term_alpha_log(X, bone_idx, alpha)
+        + term_prior_mahalanobis(X, mu, Sigma_inv, lam_prior)
+        + term_angle_mbeta_sq(
+            X, angle_triplets, angle_ranges, lam_angle, beta=beta_angle
+        )
+    )
+
+
+def optimize_pose_with_torch(
+    X0_np, x2d_np, K_np,
+    bone_idx_t, l_ij_t, sigma_ij_t,
+    mu_np, Sigma_inv_np,
+    angle_triplets, angle_ranges,
+    delta=3.0, lam_bone=1.0, alpha=0.0, lam_prior=1.0, lam_angle=1.0,
+    Zmin=0.0, Zmax=15.0,              # <-- thêm Zmax
+    steps_adam=15000, steps_lbfgs=1000, lr_adam=1e-3, beta_angle=20.0,
+):
     """
-    Tổng Huber trên TẤT CẢ residuals (data + bone + prior + angle) để robust.
+    R=I, t=0 như công thức. Z được ràng buộc Z >= Zmin bằng softplus.
     """
-    r = []
-    r.append(torch_residuals_data (X, x2d, K, R, t))
-    r.append(torch_residuals_bone (X, bones, lam_bone))
-    r.append(torch_residuals_prior(X, mu, Sigma_inv, lam_prior))
-    r.append(torch_residuals_angle(X, angle_triplets, angle_ranges, lam_angle))
-    r = torch.cat(r)
-
-    # Huber loss theo chuẩn SciPy (f_scale)
-    a = torch.abs(r)
-    fs = torch.tensor(f_scale, dtype=X.dtype)
-    huber = torch.where(a <= fs, 0.5*(r**2), fs*(a - 0.5*fs))
-    return huber.sum()
-
-def optimize_pose_with_torch(X0_np, x2d_np, K_np, bones, mu_np, Sigma_inv_np,
-                             angle_triplets, angle_ranges,
-                             lam_bone=2.0, lam_prior=1.0, lam_angle=1.0,
-                             Zmin=0.0, steps_adam=30000, steps_lbfgs=2000):
-    J = X0_np.shape[0]
-
-    # Chuẩn bị dữ liệu torch
+    
+    # to torch
     x2d = to_torch(x2d_np)
-    K   = to_torch(K_np)
-    R   = torch.eye(3, dtype=torch.float64, device=device)
-    t   = torch.zeros(3, dtype=torch.float64, device=device)
-    mu  = to_torch(mu_np)
+    K = to_torch(K_np)
+    R = torch.eye(3, dtype=torch.float64, device=device)
+    t = torch.zeros(3, dtype=torch.float64, device=device)
+    
+    mu = to_torch(mu_np)
     Sigma_inv = to_torch(Sigma_inv_np)
 
-    # Tham số hoá X = [x_raw, y_raw, Zmin + softplus(z_raw)]
+    # parameterize X: [x_raw, y_raw, Zmin + (Zmax-Zmin)*sigmoid(s_raw)]
     X0 = to_torch(X0_np)
-    x_raw = torch.nn.Parameter(X0[:,0].clone())
-    y_raw = torch.nn.Parameter(X0[:,1].clone())
-    # lấy z_raw sao cho softplus(z_raw) ~ X0[:,2]-Zmin
-    z_raw = torch.nn.Parameter(torch.log(torch.exp(torch.clamp(X0[:,2]-Zmin, min=1e-3)) - 1.0))
+    x_raw = torch.nn.Parameter(X0[:, 0].clone())
+    y_raw = torch.nn.Parameter(X0[:, 1].clone())
 
-    opt = torch.optim.Adam([x_raw, y_raw, z_raw], lr=1e-2)
+    # init s_raw từ Z0 qua logit
+    eps = 1e-6
+    z0 = torch.clamp(X0[:, 2], min=Zmin + eps, max=Zmax - eps)
+    p0 = (z0 - Zmin) / max(float(Zmax - Zmin), eps)
+    s_init = torch.log(p0 / (1.0 - p0)) # logit
+    s_raw = torch.nn.Parameter(s_init.clone())
+    
+    def get_Z(s_raw):
+        return Zmin + (Zmax - Zmin) * torch.sigmoid(s_raw)
+
+    opt = torch.optim.Adam([x_raw, y_raw, s_raw], lr=lr_adam)
     for _ in range(steps_adam):
         opt.zero_grad()
-        Z = Zmin + torch.nn.functional.softplus(z_raw)
+        Z = get_Z(s_raw)
         X = torch.stack([x_raw, y_raw, Z], dim=1)
-        loss = torch_objective(X, x2d, K, R, t, bones, mu, Sigma_inv,
-                               angle_triplets, angle_ranges,
-                               lam_bone, lam_prior, lam_angle, f_scale=3.0)
+        loss = objective_F(
+            X, x2d, K, R, t,
+            bone_idx_t, l_ij_t, sigma_ij_t,
+            mu, Sigma_inv, angle_triplets, angle_ranges,
+            delta, lam_bone, alpha, lam_prior, lam_angle, beta_angle=beta_angle,
+        )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([x_raw, y_raw, z_raw], max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_([x_raw, y_raw, s_raw], max_norm=10.0)
         opt.step()
 
     def closure():
         opt_lbfgs.zero_grad()
-        Z = Zmin + torch.nn.functional.softplus(z_raw)
+        Z = get_Z(s_raw)
         X = torch.stack([x_raw, y_raw, Z], dim=1)
-        loss = torch_objective(X, x2d, K, R, t, bones, mu, Sigma_inv,
-                               angle_triplets, angle_ranges,
-                               lam_bone, lam_prior, lam_angle, f_scale=3.0)
+        loss = objective_F(
+            X, x2d, K, R, t,
+            bone_idx_t, l_ij_t, sigma_ij_t,
+            mu, Sigma_inv, angle_triplets, angle_ranges,
+            delta, lam_bone, alpha, lam_prior, lam_angle, beta_angle=beta_angle,
+        )
         loss.backward()
         return loss
 
-    opt_lbfgs = torch.optim.LBFGS([x_raw, y_raw, z_raw], lr=1.0, max_iter=steps_lbfgs,
-                                  line_search_fn="strong_wolfe")
+    opt_lbfgs = torch.optim.LBFGS(
+        [x_raw, y_raw, s_raw],
+        lr=1.0,
+        max_iter=steps_lbfgs,
+        line_search_fn="strong_wolfe",
+    )
     opt_lbfgs.step(closure)
 
     with torch.no_grad():
-        X_final = torch.stack([x_raw,
-                               y_raw,
-                               Zmin + torch.nn.functional.softplus(z_raw)], dim=1)
-    return X_final.cpu().numpy()
+        X_final = torch.stack(
+            [x_raw, y_raw, get_Z(s_raw)], dim=1
+        )
+    return X_final.detach().cpu().numpy()
 
 
 import numpy as np
@@ -246,6 +356,7 @@ X_sample_raw = load_x_sample_from_3dpw(
 print(X_sample_raw)
 X_sample = to_cv_from_3dpw(X_sample_raw)
 print("Sample 3D points:\n", X_sample)
+
 # ------------------ Init problem ------------------
 # Camera intrinsics
 f = 1000.0
@@ -259,38 +370,42 @@ Zmin, Zmax = 0.0, 15.0
 lb = np.tile([-M, -M, Zmin], J)
 ub = np.tile([M, M, Zmax], J)
 
-# ------------------ Bone priors ------------------
-bone_table = [
-    ("pelvis", "left_hip", 0.104),
-    ("pelvis", "right_hip", 0.106),
-    ("pelvis", "spine1", 0.114),
-    ("left_hip", "left_knee", 0.376),
-    ("right_hip", "right_knee", 0.379),
-    ("left_knee", "left_ankle", 0.404),
-    ("right_knee", "right_ankle", 0.400),
-    ("left_ankle", "left_foot", 0.134),
-    ("right_ankle", "right_foot", 0.137),
-    ("spine1", "spine2", 0.136),
-    ("spine2", "spine3", 0.054),
-    ("spine3", "neck", 0.207),
-    ("neck", "head", 0.092),
-    ("neck", "left_collar", 0.121),
-    ("neck", "right_collar", 0.116),
-    ("left_collar", "left_shoulder", 0.109),
-    ("right_collar", "right_shoulder", 0.106),
-    ("left_shoulder", "left_elbow", 0.253),
-    ("right_shoulder", "right_elbow", 0.252),
-    ("left_elbow", "left_wrist", 0.251),
-    ("right_elbow", "right_wrist", 0.256),
-    ("left_wrist", "left_hand", 0.083),
-    ("right_wrist", "right_hand", 0.080),
+# ---- build bone_idx, l_ij, sigma_ij từ bảng log-space bạn đã tính ----
+bone_stats_table = [
+    ("pelvis", "left_hip", 0.1040, 0.0143),
+    ("pelvis", "right_hip", 0.1061, 0.0322),
+    ("pelvis", "spine1", 0.1129, 0.1437),
+    ("left_hip", "left_knee", 0.3758, 0.0345),
+    ("right_hip", "right_knee", 0.3785, 0.0200),
+    ("left_knee", "left_ankle", 0.4033, 0.0611),
+    ("right_knee", "right_ankle", 0.3996, 0.0543),
+    ("left_ankle", "left_foot", 0.1338, 0.0609),
+    ("right_ankle", "right_foot", 0.1361, 0.0877),
+    ("spine1", "spine2", 0.1361, 0.0338),
+    ("spine2", "spine3", 0.0543, 0.0349),
+    ("spine3", "neck", 0.2071, 0.0364),
+    ("neck", "head", 0.0918, 0.1110),
+    ("neck", "left_collar", 0.1210, 0.0750),
+    ("neck", "right_collar", 0.1162, 0.0457),
+    ("left_collar", "left_shoulder", 0.1064, 0.2195),
+    ("right_collar", "right_shoulder", 0.1049, 0.1585),
+    ("left_shoulder", "left_elbow", 0.2533, 0.0141),
+    ("right_shoulder", "right_elbow", 0.2518, 0.0414),
+    ("left_elbow", "left_wrist", 0.2501, 0.0623),
+    ("right_elbow", "right_wrist", 0.2553, 0.0533),
+    ("left_wrist", "left_hand", 0.0830, 0.0671),
+    ("right_wrist", "right_hand", 0.0835, 0.0728),
 ]
-bones = []
-for a, b, L in bone_table:
-    if a not in name_to_idx or b not in name_to_idx:
-        raise KeyError(f"Bone name not in joint_names_from_file: {a}, {b}")
 
-    bones.append((name_to_idx[a], name_to_idx[b], L))
+bone_idx_np, l_ij_np, sigma_ij_np = [], [], []
+for a, b, L, S in bone_stats_table:
+    bone_idx_np.append([name_to_idx[a], name_to_idx[b]])
+    l_ij_np.append(L)
+    sigma_ij_np.append(S)
+
+bone_idx_t = torch.tensor(bone_idx_np, dtype=torch.long, device=device)
+l_ij_t = torch.tensor(l_ij_np, dtype=torch.float64, device=device)
+sigma_ij_t = torch.tensor(sigma_ij_np, dtype=torch.float64, device=device)
 
 # ------------------ Mean coords (mu) & Sigma^{-1} ------------------
 mu_raw = np.array(
@@ -324,103 +439,130 @@ mu_raw = np.array(
 )
 
 mu = to_cv_from_3dpw(mu_raw)
-Sigma_inv = np.array([
-    [[ 3.16607069e+00, -4.55135000e+00, -8.20618491e-02],
-     [-4.55135000e+00,  5.84561460e+01,  2.81741128e-01],
-     [-8.20618491e-02,  2.81741128e-01,  1.22058895e+01]],
-
-    [[ 3.09180775e+00, -4.41315387e+00, -5.93043152e-01],
-     [-4.41315387e+00,  6.04653628e+01, -4.20625991e-01],
-     [-5.93043152e-01, -4.20625991e-01,  1.09659973e+01]],
-
-    [[ 3.08753629e+00, -4.72120424e+00,  2.24209579e-01],
-     [-4.72120424e+00,  6.25784885e+01, -8.20562253e-02],
-     [ 2.24209579e-01, -8.20562253e-02,  1.36997143e+01]],
-
-    [[ 3.07126663e+00, -4.23907264e+00,  1.37352565e-01],
-     [-4.23907264e+00,  5.12885078e+01,  3.38779308e-01],
-     [ 1.37352565e-01,  3.38779308e-01,  1.15581938e+01]],
-
-    [[ 3.38738070e+00, -4.23324581e+00, -5.72605665e-01],
-     [-4.23324581e+00,  7.65881289e+01,  1.88970551e-01],
-     [-5.72605665e-01,  1.88970551e-01,  7.71718250e+00]],
-
-    [[ 3.53893104e+00, -4.93917084e+00,  1.76716929e+00],
-     [-4.93917084e+00,  7.75365492e+01,  9.93346086e-01],
-     [ 1.76716929e+00,  9.93346086e-01,  1.52646820e+01]],
-
-    [[ 3.41476185e+00, -3.62429541e+00,  3.36113014e-01],
-     [-3.62429541e+00,  4.05736286e+01,  2.83357862e+00],
-     [ 3.36113014e-01,  2.83357862e+00,  1.11680057e+01]],
-
-    [[ 2.98908965e+00, -3.57740850e+00, -6.35335261e-01],
-     [-3.57740850e+00,  8.86271513e+01, -1.28225100e+00],
-     [-6.35335261e-01, -1.28225100e+00,  6.55470631e+00]],
-
-    [[ 2.88346869e+00, -4.38100722e+00,  1.54813457e+00],
-     [-4.38100722e+00,  8.57105050e+01,  1.04354015e-01],
-     [ 1.54813457e+00,  1.04354015e-01,  1.22882911e+01]],
-
-    [[ 3.58938077e+00, -3.20430900e+00,  5.51915957e-01],
-     [-3.20430900e+00,  3.41193172e+01,  3.34070417e+00],
-     [ 5.51915957e-01,  3.34070417e+00,  1.10507928e+01]],
-
-    [[ 3.19659764e+00, -2.01314508e+00, -6.34602457e-01],
-     [-2.01314508e+00,  8.77225048e+01,  9.04854893e-01],
-     [-6.34602457e-01,  9.04854893e-01,  5.89460366e+00]],
-
-    [[ 3.33215057e+00, -4.12023544e+00,  2.03557713e+00],
-     [-4.12023544e+00,  9.90018975e+01,  2.76259478e+00],
-     [ 2.03557713e+00,  2.76259478e+00,  1.26021635e+01]],
-
-    [[ 3.96850324e+00, -2.36143147e+00,  9.87164182e-01],
-     [-2.36143147e+00,  2.57407315e+01,  4.61320374e+00],
-     [ 9.87164182e-01,  4.61320374e+00,  9.75743134e+00]],
-
-    [[ 3.66913655e+00, -2.83163343e+00,  2.51946507e-01],
-     [-2.83163343e+00,  3.02152980e+01,  3.82453750e+00],
-     [ 2.51946507e-01,  3.82453750e+00,  9.12098161e+00]],
-
-    [[ 3.85326711e+00, -2.67494077e+00,  1.30588267e+00],
-     [-2.67494077e+00,  3.00845061e+01,  4.66984565e+00],
-     [ 1.30588267e+00,  4.66984565e+00,  1.13129316e+01]],
-
-    [[ 4.33773676e+00, -2.08820015e+00,  1.12335989e+00],
-     [-2.08820015e+00,  2.12073187e+01,  4.30386344e+00],
-     [ 1.12335989e+00,  4.30386344e+00,  9.20779418e+00]],
-
-    [[ 3.56190916e+00, -2.71033829e+00, -2.41532475e-01],
-     [-2.71033829e+00,  2.67078573e+01,  3.33417251e+00],
-     [-2.41532475e-01,  3.33417251e+00,  7.54327884e+00]],
-
-    [[ 4.20179562e+00, -2.11043639e+00,  2.20259734e+00],
-     [-2.11043639e+00,  2.62659407e+01,  5.09370265e+00],
-     [ 2.20259734e+00,  5.09370265e+00,  1.19880445e+01]],
-
-    [[ 3.21956291e+00, -2.65844148e+00, -6.48461454e-01],
-     [-2.65844148e+00,  2.80187633e+01,  3.25763503e+00],
-     [-6.48461454e-01,  3.25763503e+00,  6.91346387e+00]],
-
-    [[ 3.84915957e+00, -1.70540623e+00,  2.41139000e+00],
-     [-1.70540623e+00,  2.75810160e+01,  5.64420119e+00],
-     [ 2.41139000e+00,  5.64420119e+00,  1.21290594e+01]],
-
-    [[ 3.47782416e+00, -2.78349034e+00, -3.06438627e-01],
-     [-2.78349034e+00,  2.94464689e+01,  3.52403142e+00],
-     [-3.06438627e-01,  3.52403142e+00,  6.86868437e+00]],
-
-    [[ 4.01724087e+00, -1.76150403e+00,  2.33802219e+00],
-     [-1.76150403e+00,  3.08852411e+01,  5.92448990e+00],
-     [ 2.33802219e+00,  5.92448990e+00,  1.01960634e+01]],
-
-    [[ 3.52385252e+00, -2.55785853e+00, -1.60744911e-01],
-     [-2.55785853e+00,  2.78470819e+01,  3.27914211e+00],
-     [-1.60744911e-01,  3.27914211e+00,  6.46535793e+00]],
-
-    [[ 4.03914407e+00, -1.77312327e+00,  2.28191266e+00],
-     [-1.77312327e+00,  2.98676775e+01,  5.47988550e+00],
-     [ 2.28191266e+00,  5.47988550e+00,  9.27951430e+00]],
-])
+Sigma_inv = np.array(
+    [
+        [
+            [3.16607069e00, -4.55135000e00, -8.20618491e-02],
+            [-4.55135000e00, 5.84561460e01, 2.81741128e-01],
+            [-8.20618491e-02, 2.81741128e-01, 1.22058895e01],
+        ],
+        [
+            [3.09180775e00, -4.41315387e00, -5.93043152e-01],
+            [-4.41315387e00, 6.04653628e01, -4.20625991e-01],
+            [-5.93043152e-01, -4.20625991e-01, 1.09659973e01],
+        ],
+        [
+            [3.08753629e00, -4.72120424e00, 2.24209579e-01],
+            [-4.72120424e00, 6.25784885e01, -8.20562253e-02],
+            [2.24209579e-01, -8.20562253e-02, 1.36997143e01],
+        ],
+        [
+            [3.07126663e00, -4.23907264e00, 1.37352565e-01],
+            [-4.23907264e00, 5.12885078e01, 3.38779308e-01],
+            [1.37352565e-01, 3.38779308e-01, 1.15581938e01],
+        ],
+        [
+            [3.38738070e00, -4.23324581e00, -5.72605665e-01],
+            [-4.23324581e00, 7.65881289e01, 1.88970551e-01],
+            [-5.72605665e-01, 1.88970551e-01, 7.71718250e00],
+        ],
+        [
+            [3.53893104e00, -4.93917084e00, 1.76716929e00],
+            [-4.93917084e00, 7.75365492e01, 9.93346086e-01],
+            [1.76716929e00, 9.93346086e-01, 1.52646820e01],
+        ],
+        [
+            [3.41476185e00, -3.62429541e00, 3.36113014e-01],
+            [-3.62429541e00, 4.05736286e01, 2.83357862e00],
+            [3.36113014e-01, 2.83357862e00, 1.11680057e01],
+        ],
+        [
+            [2.98908965e00, -3.57740850e00, -6.35335261e-01],
+            [-3.57740850e00, 8.86271513e01, -1.28225100e00],
+            [-6.35335261e-01, -1.28225100e00, 6.55470631e00],
+        ],
+        [
+            [2.88346869e00, -4.38100722e00, 1.54813457e00],
+            [-4.38100722e00, 8.57105050e01, 1.04354015e-01],
+            [1.54813457e00, 1.04354015e-01, 1.22882911e01],
+        ],
+        [
+            [3.58938077e00, -3.20430900e00, 5.51915957e-01],
+            [-3.20430900e00, 3.41193172e01, 3.34070417e00],
+            [5.51915957e-01, 3.34070417e00, 1.10507928e01],
+        ],
+        [
+            [3.19659764e00, -2.01314508e00, -6.34602457e-01],
+            [-2.01314508e00, 8.77225048e01, 9.04854893e-01],
+            [-6.34602457e-01, 9.04854893e-01, 5.89460366e00],
+        ],
+        [
+            [3.33215057e00, -4.12023544e00, 2.03557713e00],
+            [-4.12023544e00, 9.90018975e01, 2.76259478e00],
+            [2.03557713e00, 2.76259478e00, 1.26021635e01],
+        ],
+        [
+            [3.96850324e00, -2.36143147e00, 9.87164182e-01],
+            [-2.36143147e00, 2.57407315e01, 4.61320374e00],
+            [9.87164182e-01, 4.61320374e00, 9.75743134e00],
+        ],
+        [
+            [3.66913655e00, -2.83163343e00, 2.51946507e-01],
+            [-2.83163343e00, 3.02152980e01, 3.82453750e00],
+            [2.51946507e-01, 3.82453750e00, 9.12098161e00],
+        ],
+        [
+            [3.85326711e00, -2.67494077e00, 1.30588267e00],
+            [-2.67494077e00, 3.00845061e01, 4.66984565e00],
+            [1.30588267e00, 4.66984565e00, 1.13129316e01],
+        ],
+        [
+            [4.33773676e00, -2.08820015e00, 1.12335989e00],
+            [-2.08820015e00, 2.12073187e01, 4.30386344e00],
+            [1.12335989e00, 4.30386344e00, 9.20779418e00],
+        ],
+        [
+            [3.56190916e00, -2.71033829e00, -2.41532475e-01],
+            [-2.71033829e00, 2.67078573e01, 3.33417251e00],
+            [-2.41532475e-01, 3.33417251e00, 7.54327884e00],
+        ],
+        [
+            [4.20179562e00, -2.11043639e00, 2.20259734e00],
+            [-2.11043639e00, 2.62659407e01, 5.09370265e00],
+            [2.20259734e00, 5.09370265e00, 1.19880445e01],
+        ],
+        [
+            [3.21956291e00, -2.65844148e00, -6.48461454e-01],
+            [-2.65844148e00, 2.80187633e01, 3.25763503e00],
+            [-6.48461454e-01, 3.25763503e00, 6.91346387e00],
+        ],
+        [
+            [3.84915957e00, -1.70540623e00, 2.41139000e00],
+            [-1.70540623e00, 2.75810160e01, 5.64420119e00],
+            [2.41139000e00, 5.64420119e00, 1.21290594e01],
+        ],
+        [
+            [3.47782416e00, -2.78349034e00, -3.06438627e-01],
+            [-2.78349034e00, 2.94464689e01, 3.52403142e00],
+            [-3.06438627e-01, 3.52403142e00, 6.86868437e00],
+        ],
+        [
+            [4.01724087e00, -1.76150403e00, 2.33802219e00],
+            [-1.76150403e00, 3.08852411e01, 5.92448990e00],
+            [2.33802219e00, 5.92448990e00, 1.01960634e01],
+        ],
+        [
+            [3.52385252e00, -2.55785853e00, -1.60744911e-01],
+            [-2.55785853e00, 2.78470819e01, 3.27914211e00],
+            [-1.60744911e-01, 3.27914211e00, 6.46535793e00],
+        ],
+        [
+            [4.03914407e00, -1.77312327e00, 2.28191266e00],
+            [-1.77312327e00, 2.98676775e01, 5.47988550e00],
+            [2.28191266e00, 5.47988550e00, 9.27951430e00],
+        ],
+    ]
+)
 
 # Triplets: (i,j,k) với góc tại j
 angle_triplets = [
@@ -484,14 +626,27 @@ X0 = backproject_fixed_depth(x2d, K, z0=0.5)
 print("Initial 3D points:\n", X0)
 X0_init = X0  # dùng init của bạn, càng tốt nếu là init_from_bones
 X_opt = optimize_pose_with_torch(
-    X0_init, x2d, K, bones, mu, Sigma_inv,
-    angle_triplets, angle_ranges,
-    lam_bone=10.0, lam_prior=1.0, lam_angle=1.0,
-    Zmin=0.15,
+    X0_init,
+    x2d,
+    K,
+    bone_idx_t,
+    l_ij_t,
+    sigma_ij_t,
+    mu,
+    Sigma_inv,
+    angle_triplets,
+    angle_ranges,
+    delta=3.0,
+    lam_bone=5.0,
+    alpha=1,
+    lam_prior=1.0,
+    lam_angle=10.0,
+    Zmin=0,
+    Zmax=15.0,
+    lr_adam=1e-3,
 )
+
 proj_opt = project_pinhole(K, R, t, X_opt)
-
-
 # ------------------ Plot ------------------
 EDGES_3DPW = [
     (0, 1),
