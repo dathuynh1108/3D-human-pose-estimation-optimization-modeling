@@ -70,11 +70,21 @@ def term_prior_mahalanobis(X_local, mu, Sigma_inv, lam_prior):
 def torch_axis_angle_to_matrix(rotvec):
     theta = torch.linalg.norm(rotvec)
     if theta < 1e-9:
-        return torch.eye(3, dtype=rotvec.dtype, device=rotvec.device)
+        # Small-angle approximation
+        K = torch.tensor(
+            [[0.0, -rotvec[2].detach(), rotvec[1].detach()],
+            [rotvec[2].detach(), 0.0, -rotvec[0].detach()],
+            [-rotvec[1].detach(), rotvec[0].detach(), 0.0]],
+            dtype=rotvec.dtype,
+            device=rotvec.device,
+        )
+        return torch.eye(3, dtype=rotvec.dtype, device=rotvec.device) + K
     axis = rotvec / theta
     x, y, z = axis
     K = torch.tensor(
-        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=rotvec.dtype, device=rotvec.device
+        [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
+        dtype=rotvec.dtype,
+        device=rotvec.device,
     )
     outer = axis.unsqueeze(1) @ axis.unsqueeze(0)
     c = torch.cos(theta)
