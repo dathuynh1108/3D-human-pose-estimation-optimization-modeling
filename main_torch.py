@@ -83,6 +83,23 @@ def term_prior_mahalanobis(X_local, mu, Sigma_inv, lam_prior):
 
 
 
+def torch_axis_angle_to_matrix(rotvec):
+    """
+    Convert axis-angle (3,) into rotation matrix (3,3) using Rodrigues formula.
+    """
+    theta = torch.linalg.norm(rotvec)
+    if theta < 1e-9:
+        return torch.eye(3, dtype=rotvec.dtype, device=rotvec.device)
+    axis = rotvec / theta
+    x, y, z = axis
+    K = torch.tensor([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]], dtype=rotvec.dtype, device=rotvec.device)
+    outer = axis.unsqueeze(1) @ axis.unsqueeze(0)
+    c = torch.cos(theta)
+    s = torch.sin(theta)
+    eye = torch.eye(3, dtype=rotvec.dtype, device=rotvec.device)
+    return c * eye + s * K + (1.0 - c) * outer
+
+
 def align_pose_to_mu(X, mu):
     """Align pose X (camera frame) to pelvis-centred statistics μ via Kabsch."""
     pelvis = X[0]
@@ -97,8 +114,6 @@ def align_pose_to_mu(X, mu):
         R = V @ U.transpose(-2, -1)
     X_aligned = X_centered @ R
     return X_aligned, R, pelvis
-
-
 
 def term_direction_cos(X, dir_idx, dir_ref, lam_dir, eps=1e-9):
     """Penalize bones pointing opposite to reference direction in pelvis-aligned frame."""
@@ -164,23 +179,30 @@ def objective_F(
     n_ref,
     dir_idx,
     dir_ref,
+    r_axis,
     delta,  # Huber delta
     lam_bone,
     alpha,
     lam_prior,
     lam_angle,
     lam_dir,
+    lam_rot,
     beta_angle=20.0,
 ):
-    X_aligned, R_pose, pelvis = align_pose_to_mu(X, mu)
-    return (
+    pelvis = X[0]
+    X_centered = X - pelvis
+    R_pose = torch_axis_angle_to_matrix(r_axis)
+    X_local = X_centered @ R_pose
+    loss = (
         term_data_huber(X, x2d, K, R, t, delta)
         + term_bone_logratio_sq(X, bone_idx, l_ij, sigma_ij, lam_bone)
         + term_alpha_log(X, bone_idx, alpha)
-        + term_prior_mahalanobis(X_aligned, mu, Sigma_inv, lam_prior)
-        + term_angle_mbeta_sq(X_aligned, angle_idx, angle_bounds, n_ref, lam_angle, beta=beta_angle)
-        + term_direction_cos(X_aligned, dir_idx, dir_ref, lam_dir)
+        + term_prior_mahalanobis(X_local, mu, Sigma_inv, lam_prior)
+        + term_angle_mbeta_sq(X_local, angle_idx, angle_bounds, n_ref, lam_angle, beta=beta_angle)
+        + term_direction_cos(X_local, dir_idx, dir_ref, lam_dir)
     )
+    loss += lam_rot * (r_axis * r_axis).sum()
+    return loss
 
 
 def optimize_pose_with_torch(
@@ -188,7 +210,7 @@ def optimize_pose_with_torch(
     bone_idx_t, l_ij_t, sigma_ij_t,
     mu_np, Sigma_inv_np,
     angle_idx_t, angle_bounds_t,
-    delta=3.0, lam_bone=1.0, alpha=0.0, lam_prior=1.0, lam_angle=1.0, lam_dir=5.0,
+    delta=3.0, lam_bone=1.0, alpha=0.0, lam_prior=1.0, lam_angle=1.0, lam_dir=5.0, lam_rot=0.1,
     Zmin=0.0, Zmax=15.0,              # <-- thêm Zmax
     steps_adam=15000, steps_lbfgs=1000, lr_adam=1e-3, beta_angle=20.0,
 ):
@@ -229,11 +251,12 @@ def optimize_pose_with_torch(
     p0 = (z0 - Zmin) / max(float(Zmax - Zmin), eps)
     s_init = torch.log(p0 / (1.0 - p0)) # logit
     s_raw = torch.nn.Parameter(s_init.clone())
-    
+    r_raw = torch.nn.Parameter(torch.zeros(3, dtype=float_dtype, device=device))
+
     def get_Z(s_raw):
         return Zmin + (Zmax - Zmin) * torch.sigmoid(s_raw)
 
-    opt = torch.optim.Adam([x_raw, y_raw, s_raw], lr=lr_adam)
+    opt = torch.optim.Adam([x_raw, y_raw, s_raw, r_raw], lr=lr_adam)
     for _ in range(steps_adam):
         opt.zero_grad()
         Z = get_Z(s_raw)
@@ -242,11 +265,11 @@ def optimize_pose_with_torch(
             X, x2d, K, R, t,
             bone_idx_t, l_ij_t, sigma_ij_t,
             mu, Sigma_inv, angle_idx, angle_bounds, n_ref,
-            dir_idx_t, dir_ref_t,
-            delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, beta_angle=beta_angle,
+            dir_idx_t, dir_ref_t, r_raw,
+            delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, lam_rot, beta_angle=beta_angle,
         )
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([x_raw, y_raw, s_raw], max_norm=10.0)
+        torch.nn.utils.clip_grad_norm_([x_raw, y_raw, s_raw, r_raw], max_norm=10.0)
         opt.step()
 
     def closure():
@@ -257,14 +280,14 @@ def optimize_pose_with_torch(
             X, x2d, K, R, t,
             bone_idx_t, l_ij_t, sigma_ij_t,
             mu, Sigma_inv, angle_idx, angle_bounds, n_ref,
-            dir_idx_t, dir_ref_t,
-            delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, beta_angle=beta_angle,
+            dir_idx_t, dir_ref_t, r_raw,
+            delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, lam_rot, beta_angle=beta_angle,
         )
         loss.backward()
         return loss
 
     opt_lbfgs = torch.optim.LBFGS(
-        [x_raw, y_raw, s_raw],
+        [x_raw, y_raw, s_raw, r_raw],
         lr=1.0,
         max_iter=steps_lbfgs,
         line_search_fn="strong_wolfe",
@@ -275,7 +298,7 @@ def optimize_pose_with_torch(
         X_final = torch.stack(
             [x_raw, y_raw, get_Z(s_raw)], dim=1
         )
-    return X_final.detach().cpu().numpy()
+    return X_final.detach().cpu().numpy(), r_raw.detach().cpu().numpy()
 
 
 import numpy as np
@@ -350,7 +373,7 @@ print("2D points (with noise):\n", x2d)
 X0 = backproject_fixed_depth(x2d, K, z0=0.5)
 print("Initial 3D points:\n", X0)
 X0_init = X0  # dùng init của bạn, càng tốt nếu là init_from_bones
-X_opt = optimize_pose_with_torch(
+X_opt, r_opt = optimize_pose_with_torch(
     X0_init,
     x2d,
     K,
@@ -362,39 +385,48 @@ X_opt = optimize_pose_with_torch(
     angle_idx_t,
     angle_bounds_t,
     delta=3.0,
-    lam_bone=10.0,
+    lam_bone=50.0,
     alpha=1e-3,
     lam_prior=5,
-    lam_angle=10.0,
-    lam_dir=5.0,
+    lam_angle=120.0,
+    lam_dir=50.0,
+    lam_rot=0.01,
     Zmin=0.1,
     Zmax=15.0,
     lr_adam=1e-3,
+    beta_angle=60.0,
 )
 
 # ---------------------------------------------------------------------
 print("\n== Results ==")
 print("Optimized 3D points:\n", X_opt)
 
-def compute_signed_angles(X_np):
+def compute_signed_angles(X_np, r_axis_np):
     X_t = torch.as_tensor(X_np, dtype=float_dtype, device=device)
+    r_t = torch.as_tensor(r_axis_np, dtype=float_dtype, device=device)
+    pelvis = X_t[0]
+    X_centered = X_t - pelvis
+    R_pose = torch_axis_angle_to_matrix(r_t)
+    X_local = X_centered @ R_pose
+    n_ref_local = build_angle_refs_from_mu_torch(torch.as_tensor(mu_np, dtype=float_dtype, device=device), angle_idx_t)
     i = angle_idx_t[:, 0]
     j = angle_idx_t[:, 1]
     k = angle_idx_t[:, 2]
-    u = X_t[i] - X_t[j]
-    v = X_t[k] - X_t[j]
+    u = X_local[i] - X_local[j]
+    v = X_local[k] - X_local[j]
     nu = torch.clamp(u.norm(dim=1), min=1e-9)
     nv = torch.clamp(v.norm(dim=1), min=1e-9)
     dot = (u * v).sum(dim=1)
     cross = torch.cross(u, v, dim=1)
     c = dot / (nu * nv)
     c = torch.clamp(c, -1.0 + 1e-7, 1.0 - 1e-7)
-    s = (cross * build_angle_refs_from_mu_torch(to_torch(mu_np), angle_idx_t)).sum(dim=1) / (nu * nv)
+    s = (cross * n_ref_local).sum(dim=1) / (nu * nv)
     theta = torch.atan2(s, c) * (180.0 / torch.pi)
     return theta.detach().cpu().numpy()
 
-angles_before = compute_signed_angles(X0_init)
-angles_after = compute_signed_angles(X_opt)
+angles_before = compute_signed_angles(X0_init, np.zeros(3))
+angles_after = compute_signed_angles(X_opt, r_opt)
+print('Pelvis axis-angle (rad):', r_opt)
 
 print('\n== Angle diagnostics (degrees) ==')
 for idx, (abefore, aafter) in enumerate(zip(angles_before, angles_after)):
@@ -509,8 +541,8 @@ ax2.grid(True, alpha=0.3)
 ax2.invert_yaxis()
 ax2.legend()
 
-# plt.tight_layout()
-# plt.show()
+plt.tight_layout()
+plt.show()
 
 
 

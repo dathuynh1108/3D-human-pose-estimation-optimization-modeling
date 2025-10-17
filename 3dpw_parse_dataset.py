@@ -50,6 +50,7 @@ SKELETON_EDGES: Sequence[Tuple[int, int]] = [
 EPS = 1e-8
 EPS_REG = 1e-4
 EPS_ANGLE = 1e-9
+_AXIS_SIGNS = np.diag([1.0, -1.0, -1.0])
 
 
 def load_sequence(path: Path) -> dict:
@@ -68,6 +69,34 @@ def pelvis_center(joints_cv: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     pelvis_world = joints_cv[..., 0, :]  # (P, F, 3)
     joints_centered = joints_cv - pelvis_world[..., None, :]
     return joints_centered, pelvis_world
+
+
+def axis_angle_to_matrix(rotvec: np.ndarray) -> np.ndarray:
+    """Convert axis-angle vectors (..., 3) to rotation matrices (..., 3, 3)."""
+    rotvec = np.asarray(rotvec, dtype=np.float64)
+    orig_shape = rotvec.shape[:-1]
+    rot_flat = rotvec.reshape(-1, 3)
+    theta = np.linalg.norm(rot_flat, axis=1)
+
+    matrices = np.zeros((rot_flat.shape[0], 3, 3), dtype=np.float64)
+    eye = np.eye(3, dtype=np.float64)
+
+    for idx, (vec, angle) in enumerate(zip(rot_flat, theta)):
+        if angle < 1e-8:
+            matrices[idx] = eye
+            continue
+        axis = vec / angle
+        x, y, z = axis
+        K = np.array(
+            [[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]],
+            dtype=np.float64,
+        )
+        outer = np.outer(axis, axis)
+        c = np.cos(angle)
+        s = np.sin(angle)
+        matrices[idx] = c * eye + s * K + (1.0 - c) * outer
+
+    return matrices.reshape(*orig_shape, 3, 3)
 
 
 def compute_bone_stats(all_samples: np.ndarray) -> List[dict]:
@@ -179,7 +208,12 @@ def main() -> None:
     joints = reshape_joints(joints_raw)
     poses2d = np.array(data["poses2d"])
 
+    global_orient = poses[..., :3]
+    R_smpl = axis_angle_to_matrix(global_orient)
+    R_cv = np.einsum("ab,...bc,cd->...ad", _AXIS_SIGNS, R_smpl, _AXIS_SIGNS)
+
     joints_centered, pelvis_world = pelvis_center(joints)
+    joints_aligned = joints_centered @ R_cv
     num_people, num_frames, num_joints = joints.shape[:3]
 
     conf = poses2d[..., 2, :]
@@ -194,9 +228,10 @@ def main() -> None:
     print("Translation shape:", trans.shape)
     print("Joints 3D (camera frame) shape:", joints.shape)
     print("Joints 3D pelvis-centered shape:", joints_centered.shape)
+    print("Joints 3D pelvis-aligned shape:", joints_aligned.shape)
     print("Poses 2D shape:", poses2d.shape)
 
-    all_samples = joints_centered.reshape(-1, num_joints, 3)
+    all_samples = joints_aligned.reshape(-1, num_joints, 3)
     print(all_samples.shape)
 
     mean_coords = all_samples.mean(axis=0)
