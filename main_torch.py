@@ -125,7 +125,7 @@ def align_pose_to_mu(X, mu):
     X_aligned = X_centered @ R
     return X_aligned, R, pelvis
 
-def term_direction_cos(X, dir_idx, dir_ref, lam_dir, eps=1e-9):
+def term_direction_cos(X, dir_idx, dir_ref, lam_dir, dir_weights=None, eps=1e-9):
     """Penalize bones pointing opposite to reference direction in pelvis-aligned frame."""
     if lam_dir <= 0:
         return X.new_tensor(0.0)
@@ -135,7 +135,11 @@ def term_direction_cos(X, dir_idx, dir_ref, lam_dir, eps=1e-9):
     vec_norm = vec / torch.clamp(vec.norm(dim=1, keepdim=True), min=eps)
     cos = (vec_norm * dir_ref).sum(dim=1)
     penalty = torch.clamp(-cos, min=0.0)
-    return lam_dir * (penalty * penalty).sum()
+    if dir_weights is None:
+        weights = 1.0
+    else:
+        weights = dir_weights
+    return lam_dir * (weights * penalty * penalty).sum()
 
 
 def term_angle_mbeta_sq(X, angle_idx, angle_bounds, n_ref, lam_angle, beta=20.0, eps=1e-9):
@@ -189,6 +193,7 @@ def objective_F(
     n_ref,
     dir_idx,
     dir_ref,
+    dir_weights,
     r_axis,
     delta,  # Huber delta
     lam_bone,
@@ -211,7 +216,7 @@ def objective_F(
         + term_alpha_log(X, bone_idx, alpha)
         + term_prior_mahalanobis(X_local, mu, Sigma_inv, lam_prior)
         + term_angle_mbeta_sq(X_local, angle_idx, angle_bounds, n_ref, lam_angle, beta=beta_angle)
-        + term_direction_cos(X_local, dir_idx, dir_ref, lam_dir)
+        + term_direction_cos(X_local, dir_idx, dir_ref, lam_dir, dir_weights=dir_weights)
         + (lam_rot * (r_axis * r_axis).sum())
     )
 
@@ -223,7 +228,7 @@ def optimize_pose_with_torch(
     angle_idx_t, angle_bounds_t,
     delta=3.0, lam_bone=1.0, alpha=0.0, lam_prior=1.0, lam_angle=1.0, lam_dir=5.0, lam_rot=0.1,
     Zmin=0.0, Zmax=15.0,              # <-- thêm Zmax
-    steps_adam=2000, steps_lbfgs=1000, lr_adam=1e-3, beta_angle=20.0,
+    steps_adam=5000, steps_lbfgs=1000, lr_adam=1e-3, beta_angle=20.0,
 ):
     """
     R=I, t=0 như công thức. Z được ràng buộc Z >= Zmin bằng softplus.
@@ -243,13 +248,24 @@ def optimize_pose_with_torch(
     n_ref = build_angle_refs_from_mu_torch(mu, angle_idx)
 
     direction_pairs_np = np.array([
-        [name_to_idx['left_ankle'], name_to_idx['left_foot']],
-        [name_to_idx['right_ankle'], name_to_idx['right_foot']],
+        # Left leg
+        [name_to_idx['left_hip'],    name_to_idx['left_knee']],
+        [name_to_idx['left_knee'],   name_to_idx['left_ankle']],
+        [name_to_idx['left_ankle'],  name_to_idx['left_foot']],   # <-- thêm
+
+        # Right leg
+        [name_to_idx['right_hip'],   name_to_idx['right_knee']],
+        [name_to_idx['right_knee'],  name_to_idx['right_ankle']],
+        [name_to_idx['right_ankle'], name_to_idx['right_foot']],  # <-- thêm
     ], dtype=np.int64)
     dir_ref_np = mu_np[direction_pairs_np[:, 1]] - mu_np[direction_pairs_np[:, 0]]
     dir_ref_np /= np.linalg.norm(dir_ref_np, axis=1, keepdims=True)
     dir_idx_t = torch.tensor(direction_pairs_np, dtype=torch.long, device=device)
     dir_ref_t = torch.tensor(dir_ref_np, dtype=float_dtype, device=device)
+    dir_weights_np = np.ones(len(direction_pairs_np), dtype=np.float32)
+    dir_weights_np[[1, 2]] = [1.5, 3.0]  # prioritize knee→ankle and ankle→foot (left)
+    dir_weights_np[[4, 5]] = [1.5, 3.0]  # prioritize knee→ankle and ankle→foot (right)
+    dir_weights_t = torch.tensor(dir_weights_np, dtype=float_dtype, device=device)
 
     # parameterize X: [x_raw, y_raw, Zmin + (Zmax-Zmin)*sigmoid(s_raw)]
     X0 = to_torch(X0_np)
@@ -277,7 +293,7 @@ def optimize_pose_with_torch(
             X, x2d, K, R, t,
             bone_idx_t, l_ij_t, sigma_ij_t,
             mu, Sigma_inv, angle_idx, angle_bounds, n_ref,
-            dir_idx_t, dir_ref_t, r_raw,
+            dir_idx_t, dir_ref_t, dir_weights_t, r_raw,
             delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, lam_rot, beta_angle=beta_angle,
         )
         loss_history.append(loss.detach().item())
@@ -293,7 +309,7 @@ def optimize_pose_with_torch(
             X, x2d, K, R, t,
             bone_idx_t, l_ij_t, sigma_ij_t,
             mu, Sigma_inv, angle_idx, angle_bounds, n_ref,
-            dir_idx_t, dir_ref_t, r_raw,
+            dir_idx_t, dir_ref_t, dir_weights_t, r_raw,
             delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, lam_rot, beta_angle=beta_angle,
         )
         loss_history.append(loss.detach().item())
@@ -313,6 +329,36 @@ def optimize_pose_with_torch(
             [x_raw, y_raw, get_Z(s_raw)], dim=1
         )
     return X_final.detach().cpu().numpy(), r_raw.detach().cpu().numpy(), loss_history
+
+
+def optimize_pose_l2_projection(
+    X0_np,
+    x2d_np,
+    K_np,
+    steps=2000,
+    lr=5e-3,
+    Zmin=0.05,
+):
+    """Baseline optimizer that only minimizes L2 reprojection loss."""
+    x2d = to_torch(x2d_np)
+    K = to_torch(K_np)
+    R = torch.eye(3, dtype=float_dtype, device=device)
+    t = torch.zeros(3, dtype=float_dtype, device=device)
+
+    X_param = torch.nn.Parameter(to_torch(X0_np).clone())
+    opt = torch.optim.Adam([X_param], lr=lr)
+    history = []
+    for _ in range(steps):
+        opt.zero_grad()
+        proj = torch_project_pinhole(K, R, t, X_param)
+        loss = ((proj - x2d) ** 2).sum()
+        history.append(loss.detach().item())
+        loss.backward()
+        opt.step()
+        with torch.no_grad():
+            X_param[:, 2].clamp_(min=Zmin)
+
+    return X_param.detach().cpu().numpy(), history
 
 
 import numpy as np
@@ -376,6 +422,19 @@ def backproject_fixed_depth(x2d_px, K, z0=0.5):
     return z0 * rays / rays[:, 2:3]  # rays[:,2] = 1, giữ nguyên cho rõ ràng
 
 
+def mean_joint_error(X_gt, X_pred):
+    return float(np.linalg.norm(X_gt - X_pred, axis=1).mean())
+
+
+def reprojection_rmse(x_gt, x_pred):
+    diff = x_gt - x_pred
+    return float(np.sqrt(np.mean(np.sum(diff * diff, axis=1))))
+
+def backproject_random(x2d_px):
+    N = x2d_px.shape[0]
+    X0 = np.random.uniform(low=-1.0, high=1.0, size=(N,3))
+    return X0
+
 # ------------------ Project and add noise ------------------
 # Project and add noise
 x2d_clean = project_pinhole(K, R, t, X_sample)
@@ -385,8 +444,9 @@ x2d = x2d_clean + rng.normal(0, 0.8, size=x2d_clean.shape)
 print("2D points (with noise):\n", x2d)
 # ------------------ Init 3D points ------------------
 X0 = backproject_fixed_depth(x2d, K, z0=0.5)
+# X0 = backproject_random(x2d)
 print("Initial 3D points:\n", X0)
-X0_init = X0  # dùng init của bạn, càng tốt nếu là init_from_bones
+X0_init = X0
 X_opt, r_opt, loss_history = optimize_pose_with_torch(
     X0_init,
     x2d,
@@ -403,12 +463,20 @@ X_opt, r_opt, loss_history = optimize_pose_with_torch(
     alpha=1e-3,
     lam_prior=5,
     lam_angle=120.0,
-    lam_dir=50.0,
+    lam_dir=120.0,
     lam_rot=0.01,
     Zmin=0.1,
     Zmax=15.0,
     lr_adam=1e-3,
     beta_angle=60.0,
+)
+X_l2, loss_l2_history = optimize_pose_l2_projection(
+    X0_init,
+    x2d,
+    K,
+    steps=3000,
+    lr=3e-3,
+    Zmin=0.05,
 )
 
 # ---------------------------------------------------------------------
@@ -449,8 +517,25 @@ for idx, (abefore, aafter) in enumerate(zip(angles_before, angles_after)):
     print(f"{name:40s}: before={abefore:.1f}, after={aafter:.1f}")
 
 proj_opt = project_pinhole(K, R, t, X_opt)
+proj_l2 = project_pinhole(K, R, t, X_l2)
 loss_init = loss_history[0] if loss_history else float("nan")
 loss_final = loss_history[-1] if loss_history else float("nan")
+
+mpjpe_opt = mean_joint_error(X_sample, X_opt)
+mpjpe_l2 = mean_joint_error(X_sample, X_l2)
+rmse_opt = reprojection_rmse(x2d_clean, proj_opt)
+rmse_l2 = reprojection_rmse(x2d_clean, proj_l2)
+joint_err_opt_mm = np.linalg.norm(X_sample - X_opt, axis=1) * 1000.0
+joint_err_l2_mm = np.linalg.norm(X_sample - X_l2, axis=1) * 1000.0
+
+print("\n== Classical L2 baseline ==")
+print(f"MPJPE baseline (mm): {mpjpe_l2 * 1000:.1f}")
+print(f"Reprojection RMSE baseline (px): {rmse_l2:.2f}")
+print(f"Last L2 loss: {loss_l2_history[-1]:.4f}" if loss_l2_history else "No L2 history")
+
+print("\n== Optimized model ==")
+print(f"MPJPE optimized (mm): {mpjpe_opt * 1000:.1f}")
+print(f"Reprojection RMSE optimized (px): {rmse_opt:.2f}")
 # ------------------ Plot ------------------
 EDGES_3DPW = [
     (0, 1),
@@ -505,6 +590,7 @@ def label_points2d(ax, x2d, labels, color="k", fontsize=8, du=3, dv=-3):
         ax.text(p[0] + du, p[1] + dv, name, color=color, fontsize=fontsize)
 
 
+
 fig_pose = plt.figure(figsize=(15, 5))
 ax0 = fig_pose.add_subplot(131, projection="3d")
 ax1 = fig_pose.add_subplot(132, projection="3d")
@@ -522,10 +608,12 @@ draw_edges3d(ax1, X_opt, EDGES_3DPW, c="r")
 ax2.scatter(x2d_clean[:, 0], x2d_clean[:, 1], c="g", s=20, label="GT 2D")
 ax2.scatter(x2d[:, 0], x2d[:, 1], c="r", s=24, marker="x", label="GT 2D + noise")
 ax2.scatter(proj_opt[:, 0], proj_opt[:, 1], c="b", s=20, label="Optimized reproj.")
+ax2.scatter(proj_l2[:, 0], proj_l2[:, 1], c="m", s=18, label="L2 reproj.")
 
 draw_edges2d(ax2, x2d_clean, EDGES_3DPW, c="g", lw=1.0, alpha=0.4)
 draw_edges2d(ax2, x2d, EDGES_3DPW, c="b", lw=1.0, alpha=0.4)
 draw_edges2d(ax2, proj_opt, EDGES_3DPW, c="r", lw=1.0, alpha=0.6)
+draw_edges2d(ax2, proj_l2, EDGES_3DPW, c="m", lw=0.8, alpha=0.5)
 
 label_points3d(ax0, X_sample, JOINTS, color="g")
 label_points3d(ax1, X_opt, JOINTS, color="r")
@@ -593,16 +681,64 @@ ax_opt_cmp.text2D(
 
 fig_compare.tight_layout()
 
-# --- Figure 3: loss trajectory ---
-fig_loss = plt.figure(figsize=(7, 4))
-ax_loss = fig_loss.add_subplot(111)
-ax_loss.plot(loss_history, color="purple")
-ax_loss.set_title("Loss trajectory")
-ax_loss.set_xlabel("Iteration")
-ax_loss.set_ylabel("Objective F")
-ax_loss.set_yscale("log")
-ax_loss.grid(True, alpha=0.3)
+# --- Figure 3: L2 vs improved optimizer (separate views) ---
+fig_l2 = plt.figure(figsize=(12, 6))
+ax_l2_left = fig_l2.add_subplot(121, projection="3d")
+ax_l2_right = fig_l2.add_subplot(122, projection="3d")
+
+ax_l2_left.scatter(X_l2[:, 0], X_l2[:, 1], X_l2[:, 2], c="m", s=30)
+draw_edges3d(ax_l2_left, X_l2, EDGES_3DPW, c="m", lw=1.5, alpha=0.85)
+label_points3d(ax_l2_left, X_l2, JOINTS, color="m")
+ax_l2_left.set_title("L2-only optimized pose")
+ax_l2_left.set_xlabel("X (m)", labelpad=8)
+ax_l2_left.set_ylabel("Y (m)", labelpad=8)
+ax_l2_left.set_zlabel("Z (m)", labelpad=8)
+ax_l2_left.set_box_aspect([1, 1, 1])
+
+ax_l2_right.scatter(X_opt[:, 0], X_opt[:, 1], X_opt[:, 2], c="r", s=30)
+draw_edges3d(ax_l2_right, X_opt, EDGES_3DPW, c="r", lw=2.0, alpha=0.9)
+label_points3d(ax_l2_right, X_opt, JOINTS, color="r")
+ax_l2_right.set_title("Improved objective pose")
+ax_l2_right.set_xlabel("X (m)", labelpad=8)
+ax_l2_right.set_ylabel("Y (m)", labelpad=8)
+ax_l2_right.set_zlabel("Z (m)", labelpad=8)
+ax_l2_right.set_box_aspect([1, 1, 1])
+ax_l2_right.text2D(
+    0.02,
+    0.94,
+    f"MPJPE L2: {mpjpe_l2 * 1000:.1f} mm\nMPJPE improved: {mpjpe_opt * 1000:.1f} mm",
+    transform=ax_l2_right.transAxes,
+    fontsize=10,
+    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85),
+)
+
+fig_l2.tight_layout()
+
+# --- Figure 4: loss trajectory (full objective only) ---
+fig_loss = plt.figure(figsize=(6, 4))
+ax_loss_full = fig_loss.add_subplot(111)
+ax_loss_full.plot(loss_history, color="purple")
+ax_loss_full.set_title("Full objective loss")
+ax_loss_full.set_xlabel("Iteration")
+ax_loss_full.set_ylabel("Objective value")
+ax_loss_full.set_yscale("log")
+ax_loss_full.grid(True, alpha=0.3)
 fig_loss.tight_layout()
+
+# --- Figure 5: per-joint error comparison ---
+fig_joint = plt.figure(figsize=(10, 4))
+ax_joint = fig_joint.add_subplot(111)
+idx = np.arange(len(JOINTS))
+width = 0.4
+ax_joint.bar(idx - width / 2, joint_err_l2_mm, width=width, color="orange", label="L2 baseline")
+ax_joint.bar(idx + width / 2, joint_err_opt_mm, width=width, color="red", label="Optimized")
+ax_joint.set_title("Per-joint Euclidean error vs GT")
+ax_joint.set_ylabel("Error (mm)")
+ax_joint.set_xticks(idx)
+ax_joint.set_xticklabels(JOINTS, rotation=45, ha="right")
+ax_joint.grid(True, axis="y", alpha=0.3)
+ax_joint.legend()
+fig_joint.tight_layout()
 
 plt.show()
 
