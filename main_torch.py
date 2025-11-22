@@ -84,7 +84,7 @@ def term_prior_mahalanobis(X_local, mu, Sigma_inv, lam_prior):
 
 
 
-def torch_axis_angle_to_matrix(rotvec):
+def rodrigues(rotvec):
     theta = torch.linalg.norm(rotvec)
     if theta < 1e-9:
         # Small-angle approximation
@@ -201,18 +201,19 @@ def objective_F(
 ):
     pelvis = X[0]
     X_centered = X - pelvis
-    R_pose = torch_axis_angle_to_matrix(r_axis)
-    X_local = X_centered @ R_pose
-    loss = (
+    R_pose = rodrigues(r_axis)
+    
+    X_local = X_centered @ R_pose # Rotate it locally to match with Mu, do not change global position
+    
+    return (
         term_data_huber(X, x2d, K, R, t, delta)
         + term_bone_logratio_sq(X, bone_idx, l_ij, sigma_ij, lam_bone)
         + term_alpha_log(X, bone_idx, alpha)
         + term_prior_mahalanobis(X_local, mu, Sigma_inv, lam_prior)
         + term_angle_mbeta_sq(X_local, angle_idx, angle_bounds, n_ref, lam_angle, beta=beta_angle)
         + term_direction_cos(X_local, dir_idx, dir_ref, lam_dir)
+        + (lam_rot * (r_axis * r_axis).sum())
     )
-    loss += lam_rot * (r_axis * r_axis).sum()
-    return loss
 
 
 def optimize_pose_with_torch(
@@ -222,7 +223,7 @@ def optimize_pose_with_torch(
     angle_idx_t, angle_bounds_t,
     delta=3.0, lam_bone=1.0, alpha=0.0, lam_prior=1.0, lam_angle=1.0, lam_dir=5.0, lam_rot=0.1,
     Zmin=0.0, Zmax=15.0,              # <-- thêm Zmax
-    steps_adam=15000, steps_lbfgs=1000, lr_adam=1e-3, beta_angle=20.0,
+    steps_adam=2000, steps_lbfgs=1000, lr_adam=1e-3, beta_angle=20.0,
 ):
     """
     R=I, t=0 như công thức. Z được ràng buộc Z >= Zmin bằng softplus.
@@ -266,7 +267,8 @@ def optimize_pose_with_torch(
     def get_Z(s_raw):
         return Zmin + (Zmax - Zmin) * torch.sigmoid(s_raw)
 
-    opt = torch.optim.Adam([x_raw, y_raw, s_raw, r_raw], lr=lr_adam)
+    loss_history = []
+    opt = torch.optim.AdamW([x_raw, y_raw, s_raw, r_raw], lr=lr_adam)
     for _ in range(steps_adam):
         opt.zero_grad()
         Z = get_Z(s_raw)
@@ -278,6 +280,7 @@ def optimize_pose_with_torch(
             dir_idx_t, dir_ref_t, r_raw,
             delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, lam_rot, beta_angle=beta_angle,
         )
+        loss_history.append(loss.detach().item())
         loss.backward()
         torch.nn.utils.clip_grad_norm_([x_raw, y_raw, s_raw, r_raw], max_norm=10.0)
         opt.step()
@@ -293,12 +296,13 @@ def optimize_pose_with_torch(
             dir_idx_t, dir_ref_t, r_raw,
             delta, lam_bone, alpha, lam_prior, lam_angle, lam_dir, lam_rot, beta_angle=beta_angle,
         )
+        loss_history.append(loss.detach().item())
         loss.backward()
         return loss
 
     opt_lbfgs = torch.optim.LBFGS(
         [x_raw, y_raw, s_raw, r_raw],
-        lr=1.0,
+        lr=1e-1,
         max_iter=steps_lbfgs,
         line_search_fn="strong_wolfe",
     )
@@ -308,7 +312,7 @@ def optimize_pose_with_torch(
         X_final = torch.stack(
             [x_raw, y_raw, get_Z(s_raw)], dim=1
         )
-    return X_final.detach().cpu().numpy(), r_raw.detach().cpu().numpy()
+    return X_final.detach().cpu().numpy(), r_raw.detach().cpu().numpy(), loss_history
 
 
 import numpy as np
@@ -383,7 +387,7 @@ print("2D points (with noise):\n", x2d)
 X0 = backproject_fixed_depth(x2d, K, z0=0.5)
 print("Initial 3D points:\n", X0)
 X0_init = X0  # dùng init của bạn, càng tốt nếu là init_from_bones
-X_opt, r_opt = optimize_pose_with_torch(
+X_opt, r_opt, loss_history = optimize_pose_with_torch(
     X0_init,
     x2d,
     K,
@@ -416,7 +420,7 @@ def compute_signed_angles(X_np, r_axis_np):
     r_t = torch.as_tensor(r_axis_np, dtype=float_dtype, device=device)
     pelvis = X_t[0]
     X_centered = X_t - pelvis
-    R_pose = torch_axis_angle_to_matrix(r_t)
+    R_pose = rodrigues(r_t)
     X_local = X_centered @ R_pose
     n_ref_local = build_angle_refs_from_mu_torch(torch.as_tensor(mu_np, dtype=float_dtype, device=device), angle_idx_t)
     i = angle_idx_t[:, 0]
@@ -445,6 +449,8 @@ for idx, (abefore, aafter) in enumerate(zip(angles_before, angles_after)):
     print(f"{name:40s}: before={abefore:.1f}, after={aafter:.1f}")
 
 proj_opt = project_pinhole(K, R, t, X_opt)
+loss_init = loss_history[0] if loss_history else float("nan")
+loss_final = loss_history[-1] if loss_history else float("nan")
 # ------------------ Plot ------------------
 EDGES_3DPW = [
     (0, 1),
@@ -499,11 +505,10 @@ def label_points2d(ax, x2d, labels, color="k", fontsize=8, du=3, dv=-3):
         ax.text(p[0] + du, p[1] + dv, name, color=color, fontsize=fontsize)
 
 
-fig = plt.figure(figsize=(15, 5))
-ax0 = fig.add_subplot(131, projection="3d")
-ax1 = fig.add_subplot(132, projection="3d")
-ax2 = fig.add_subplot(133)
-
+fig_pose = plt.figure(figsize=(15, 5))
+ax0 = fig_pose.add_subplot(131, projection="3d")
+ax1 = fig_pose.add_subplot(132, projection="3d")
+ax2 = fig_pose.add_subplot(133)
 
 # --- GT 3D ---
 ax0.scatter(X_sample[:, 0], X_sample[:, 1], X_sample[:, 2], c="g", s=30)
@@ -521,7 +526,6 @@ ax2.scatter(proj_opt[:, 0], proj_opt[:, 1], c="b", s=20, label="Optimized reproj
 draw_edges2d(ax2, x2d_clean, EDGES_3DPW, c="g", lw=1.0, alpha=0.4)
 draw_edges2d(ax2, x2d, EDGES_3DPW, c="b", lw=1.0, alpha=0.4)
 draw_edges2d(ax2, proj_opt, EDGES_3DPW, c="r", lw=1.0, alpha=0.6)
-
 
 label_points3d(ax0, X_sample, JOINTS, color="g")
 label_points3d(ax1, X_opt, JOINTS, color="r")
@@ -547,11 +551,59 @@ ax2.set_xlabel("u (px)")
 ax2.set_ylabel("v (px)")
 ax2.set_aspect("equal", adjustable="box")
 ax2.grid(True, alpha=0.3)
-
 ax2.invert_yaxis()
 ax2.legend()
 
-plt.tight_layout()
+fig_pose.tight_layout()
+
+# --- Figure 2: initial vs optimized comparison (separate views) ---
+fig_compare = plt.figure(figsize=(12, 6))
+ax_init_cmp = fig_compare.add_subplot(121, projection="3d")
+ax_opt_cmp = fig_compare.add_subplot(122, projection="3d")
+
+ax_init_cmp.scatter(
+    X0_init[:, 0], X0_init[:, 1], X0_init[:, 2], c="orange", s=30
+)
+draw_edges3d(ax_init_cmp, X0_init, EDGES_3DPW, c="orange", lw=1.5, alpha=0.8)
+label_points3d(ax_init_cmp, X0_init, JOINTS, color="orange")
+ax_init_cmp.set_title("Initial pose (camera)")
+ax_init_cmp.set_xlabel("X (m)", labelpad=8)
+ax_init_cmp.set_ylabel("Y (m)", labelpad=8)
+ax_init_cmp.set_zlabel("Z (m)", labelpad=8)
+ax_init_cmp.set_box_aspect([1, 1, 1])
+
+ax_opt_cmp.scatter(
+    X_opt[:, 0], X_opt[:, 1], X_opt[:, 2], c="r", s=30
+)
+draw_edges3d(ax_opt_cmp, X_opt, EDGES_3DPW, c="r", lw=2.0, alpha=0.9)
+label_points3d(ax_opt_cmp, X_opt, JOINTS, color="r")
+ax_opt_cmp.set_title("Optimized pose (camera)")
+ax_opt_cmp.set_xlabel("X (m)", labelpad=8)
+ax_opt_cmp.set_ylabel("Y (m)", labelpad=8)
+ax_opt_cmp.set_zlabel("Z (m)", labelpad=8)
+ax_opt_cmp.set_box_aspect([1, 1, 1])
+ax_opt_cmp.text2D(
+    0.02,
+    0.95,
+    f"loss_init: {loss_init:.2e}\nloss_final: {loss_final:.2e}",
+    transform=ax_opt_cmp.transAxes,
+    fontsize=10,
+    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85),
+)
+
+fig_compare.tight_layout()
+
+# --- Figure 3: loss trajectory ---
+fig_loss = plt.figure(figsize=(7, 4))
+ax_loss = fig_loss.add_subplot(111)
+ax_loss.plot(loss_history, color="purple")
+ax_loss.set_title("Loss trajectory")
+ax_loss.set_xlabel("Iteration")
+ax_loss.set_ylabel("Objective F")
+ax_loss.set_yscale("log")
+ax_loss.grid(True, alpha=0.3)
+fig_loss.tight_layout()
+
 plt.show()
 
 
