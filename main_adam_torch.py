@@ -1,5 +1,6 @@
 # ==== 1) PyTorch optimizer for your objective (keep angle penalty) ====
 import torch
+import time
 from common import (
     load_x_sample_from_3dpw,
     to_cv_from_3dpw,
@@ -447,6 +448,9 @@ X0 = backproject_fixed_depth(x2d, K, z0=0.5)
 # X0 = backproject_random(x2d)
 print("Initial 3D points:\n", X0)
 X0_init = X0
+
+
+start = time.time()
 X_opt, r_opt, loss_history = optimize_pose_with_torch(
     X0_init,
     x2d,
@@ -470,6 +474,8 @@ X_opt, r_opt, loss_history = optimize_pose_with_torch(
     lr_adam=1e-3,
     beta_angle=60.0,
 )
+end = time.time()
+print(f"Optimization time: {end - start:.3f} seconds")
 X_l2, loss_l2_history = optimize_pose_l2_projection(
     X0_init,
     x2d,
